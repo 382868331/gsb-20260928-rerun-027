@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0",
+  "name": "crosswalk_intersection",
+  "step_seconds": 0.5,
+  "seed": 42,
+  "duration": 12.0,
+  "participants": [
+    {"id": "ego", "kind": "vehicle", "x": -20.0, "y": 0.0,
+     "heading": 0.0, "speed": 4.0, "accel": 0.0, "jitter": 0.02},
+    {"id": "walker", "kind": "pedestrian", "x": -3.5, "y": 2.0,
+     "heading": -1.5707963267948966, "walk_speed": 1.2, "hesitation": 0.0},
+    {"id": "light", "kind": "signal", "x": 0.0, "y": -1.5,
+     "phase": "red", "phase_ticks": 6, "auto": true},
+    {"id": "crossing_light", "kind": "signal", "x": 0.0, "y": 1.5,
+     "phase": "green", "auto": false}
+  ],
+  "events": [
+    {"id": "turn_red", "type": "signal_change", "at": 3.0,
+     "signal": "crossing_light", "phase": "red", "order": 5},
+    {"id": "ego_brake", "type": "speed_change", "at": 3.0,
+     "vehicle": "ego", "speed": 4.0, "accel": 0.0, "order": 10},
+    {"id": "near_walker", "type": "proximity_warning", "at": 0.0,
+     "a": "ego", "b": "walker", "threshold": 3.5, "order": 20},
+    {"id": "collision_stop", "type": "interrupt", "at": 0.0,
+     "a": "ego", "b": "walker", "threshold": 3.2,
+     "reason": "unsafe gap at crosswalk", "order": 1}
+  ]
+}
