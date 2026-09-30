@@ -16,8 +16,14 @@
   状态转移函数，同一时刻位置、信号、事件日志完全相同。
 - 版本与种子：Scenario.version / seed 随 save_run 持久化为 JSON。
 - 任意点分支：branch_from(engine, id, BranchChanges(...), at_ms) 保留分支点
-  以前的轨迹、事件与碰撞，之后可替换行人路线、信号灯计划，或设置车辆
-  加减速/刹车反应参数。分支定义完整写入 Scenario，可单独保存并独立重开。
+  以前（含分支点）的轨迹、事件与碰撞；分支点之后父场景已发生的事件
+  不会进入分支历史，分支内 seek 重放也不会重复累计事件。分支可只替换
+  某辆车的后续路线（vehicle_routes）、行人路线、某组信号灯计划
+  （signal_plans，自动替换分支点之后对应的 set_signal 事件），或设置
+  车辆加减速/刹车反应参数。分支定义完整写入 Scenario，可单独保存并
+  独立重开；分支之上可再分支，事件归属按各自分支点划分。
+- 差异定位：first_divergence(a, b, until_ms) 逐 tick 对比两个分支，
+  返回第一处行为差异的时刻与方面（positions/signals/collisions/events）。
 - 碰撞与原因：每 tick 按参与者碰撞半径去重产生 CollisionRecord；
   事件 action 支持 reason，compare_at(a, b, t) 可在同一时刻比较位置、
   碰撞集合/原因与事件触发原因。
