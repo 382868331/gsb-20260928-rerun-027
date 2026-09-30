@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from typing import Mapping, Optional, Tuple
 
@@ -21,6 +21,7 @@ from .scenario import (
 
 @dataclass(frozen=True)
 class BranchChanges:
+    vehicle_routes: Mapping[str, Tuple[Vec2, ...]] = field(default_factory=dict)
     pedestrian_routes: Mapping[str, Tuple[Vec2, ...]] = field(default_factory=dict)
     pedestrian_speeds: Mapping[str, float] = field(default_factory=dict)
     signal_plans: Mapping[str, Tuple[Tuple[int, str], ...]] = field(default_factory=dict)
@@ -41,8 +42,20 @@ def branch_from(
     engine.seek(branch_point)
 
     source = engine.scenario
+    known_vehicles = {vehicle.actor_id for vehicle in source.vehicles}
+    known_pedestrians = {pedestrian.actor_id for pedestrian in source.pedestrians}
+    for actor_id in changes.vehicle_routes:
+        if actor_id not in known_vehicles:
+            raise KeyError(f"unknown vehicle: {actor_id}")
+    for actor_id in changes.pedestrian_routes:
+        if actor_id not in known_pedestrians:
+            raise KeyError(f"unknown pedestrian: {actor_id}")
+    vehicles = tuple(
+        _replace_vehicle(vehicle, engine, changes.vehicle_routes.get(vehicle.actor_id))
+        for vehicle in source.vehicles
+    )
     pedestrians = tuple(
-        _replace_pedestrian(pedestrian, engine, branch_point, changes)
+        _replace_pedestrian(pedestrian, engine, changes)
         for pedestrian in source.pedestrians
     )
     signals = tuple(
@@ -69,8 +82,6 @@ def branch_from(
         branch_events.append(event)
 
     setup_records: list[EventRecord] = []
-    known_vehicles = {vehicle.actor_id for vehicle in source.vehicles}
-    known_pedestrians = {pedestrian.actor_id for pedestrian in source.pedestrians}
     for actor_id, speed in changes.pedestrian_speeds.items():
         if actor_id not in known_pedestrians:
             raise KeyError(f"unknown pedestrian: {actor_id}")
@@ -103,7 +114,7 @@ def branch_from(
         name=source.name,
         version=f"{source.version}+branch.{branch_id}",
         seed=source.seed,
-        vehicles=source.vehicles,
+        vehicles=tuple(vehicles),
         pedestrians=tuple(pedestrians),
         signals=tuple(signals),
         events=tuple(branch_events),
@@ -116,7 +127,17 @@ def branch_from(
 
     branch = ReplayEngine(scenario)
     branch.state = _clone_branch_state(engine.state, changes)
-    branch.journal = list(engine.journal)
+    # 事件归属：分支点及之前的记录是共享事实，原样保留；
+    # 父场景在分支点之后触发的事件不属于本分支，不得带入。
+    branch.journal = [
+        record for record in engine.journal if record.tick_ms <= branch_point
+    ]
+    # 分支点及之前的场景事件视为已处理：向后跳转再重放时
+    # 只重建副作用，不得再次登记/累计。
+    branch._fired = {record.event_id for record in branch.journal}
+    branch._fired.update(
+        event.event_id for event in source.events if event.tick_ms <= branch_point
+    )
     existing_fired = set(engine._fired)
     setup_by_id = {record.event_id: record for record in setup_records}
     for event in sorted(branch_events, key=lambda e: (e.tick_ms, e.seq, e.event_id)):
@@ -145,29 +166,35 @@ def branch_from(
     return branch
 
 
+def _replace_vehicle(
+    vehicle,
+    engine: ReplayEngine,
+    new_route: Optional[Tuple[Vec2, ...]],
+):
+    if new_route is None:
+        return vehicle
+    return _reroute(vehicle, engine, new_route)
+
+
 def _replace_pedestrian(
     pedestrian: Pedestrian,
     engine: ReplayEngine,
-    branch_point: int,
     changes: BranchChanges,
 ) -> Pedestrian:
     route = changes.pedestrian_routes.get(pedestrian.actor_id)
-    speed = pedestrian.speed
     if route is None:
-        if speed == pedestrian.speed:
-            return pedestrian
-        route = pedestrian.path
-    distance = engine.state.distances[pedestrian.actor_id]
-    prefix = _truncate_path(pedestrian.path, distance)
-    suffix = tuple(route)
+        return pedestrian
+    return _reroute(pedestrian, engine, route)
+
+
+def _reroute(actor, engine: ReplayEngine, new_route: Tuple[Vec2, ...]):
+    """保留分支点之前已行驶的轨迹前缀，之后接续替换后的路线。"""
+    distance = engine.state.distances[actor.actor_id]
+    prefix = _truncate_path(actor.path, distance)
+    suffix = tuple(new_route)
     if suffix and _distance(prefix[-1], suffix[0]) < 1e-12:
         suffix = suffix[1:]
-    return Pedestrian(
-        actor_id=pedestrian.actor_id,
-        path=(*prefix, *suffix),
-        speed=speed,
-        radius=pedestrian.radius,
-    )
+    return replace(actor, path=(*prefix, *suffix))
 
 
 def _replace_signal(

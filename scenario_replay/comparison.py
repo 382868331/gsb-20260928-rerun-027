@@ -35,6 +35,71 @@ class BranchComparison:
         )
 
 
+@dataclass(frozen=True)
+class Divergence:
+    """两个分支的第一处行为差异。"""
+
+    tick_ms: int
+    # 差异维度："progress"（推进中断）/ "positions" / "signals" / "collisions"
+    aspects: Tuple[str, ...]
+    actors: Tuple[str, ...] = ()
+    signals: Tuple[str, ...] = ()
+
+
+def first_divergence(
+    engine_a: ReplayEngine,
+    engine_b: ReplayEngine,
+    until_ms: int,
+    start_ms: int = 0,
+) -> Optional[Divergence]:
+    """从 start_ms 起逐 tick 对比两个引擎，返回第一处行为差异。
+
+    对比推进进度、参与者位置、信号灯相位与碰撞集合；
+    全部一致时返回 None。两个引擎须使用相同的 tick_ms。
+    """
+    tick_ms = engine_a.scenario.tick_ms
+    if tick_ms != engine_b.scenario.tick_ms:
+        raise ValueError("engines must share the same tick_ms")
+    for tick in range(start_ms, until_ms + 1, tick_ms):
+        engine_a.seek(tick)
+        engine_b.seek(tick)
+        if engine_a.now_ms != engine_b.now_ms:
+            return Divergence(tick_ms=tick, aspects=("progress",))
+        aspects: list = []
+        positions_a = engine_a.positions()
+        positions_b = engine_b.positions()
+        actors = tuple(
+            actor_id
+            for actor_id in positions_a
+            if positions_a[actor_id] != positions_b.get(actor_id)
+        )
+        if actors:
+            aspects.append("positions")
+        phases_a = engine_a.signal_phases()
+        phases_b = engine_b.signal_phases()
+        signals = tuple(
+            signal_id
+            for signal_id in phases_a
+            if phases_a[signal_id] != phases_b.get(signal_id)
+        )
+        if signals:
+            aspects.append("signals")
+        collisions_differ = (
+            _collision_snapshot(engine_a, tick).pairs
+            != _collision_snapshot(engine_b, tick).pairs
+        )
+        if collisions_differ:
+            aspects.append("collisions")
+        if aspects:
+            return Divergence(
+                tick_ms=tick,
+                aspects=tuple(aspects),
+                actors=actors,
+                signals=signals,
+            )
+    return None
+
+
 def compare_at(engine_a: ReplayEngine, engine_b: ReplayEngine, tick_ms: int) -> BranchComparison:
     engine_a.seek(tick_ms)
     engine_b.seek(tick_ms)
