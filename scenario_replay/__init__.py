@@ -2,6 +2,8 @@
 from .scenario import Scenario, Vehicle, Pedestrian, Signal, ScriptedEvent
 from .engine import ReplayEngine, EngineState
 from .storage import save_run, load_run
+from .branching import BranchChanges, branch_from
+from .comparison import BranchComparison, CollisionSnapshot, compare_at
 
 __all__ = [
     "Scenario",
@@ -13,4 +15,9 @@ __all__ = [
     "EngineState",
     "save_run",
     "load_run",
+    "BranchChanges",
+    "branch_from",
+    "BranchComparison",
+    "CollisionSnapshot",
+    "compare_at",
 ]

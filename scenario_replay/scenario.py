@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Mapping, Tuple
 
 Vec2 = Tuple[float, float]
 
@@ -16,6 +16,7 @@ class Actor:
     actor_id: str
     path: Tuple[Vec2, ...]
     speed: float  # 米/秒，沿折线路径的标量速度
+    radius: float = 1.0  # 碰撞半径（米）
 
     def position_at(self, distance: float) -> Vec2:
         """按已行驶距离在折线路径上线性插值，路径尽头后停住。"""
@@ -39,11 +40,13 @@ class Actor:
 @dataclass(frozen=True)
 class Vehicle(Actor):
     kind: str = field(default="vehicle", init=False)
+    radius: float = 2.0
 
 
 @dataclass(frozen=True)
 class Pedestrian(Actor):
     kind: str = field(default="pedestrian", init=False)
+    radius: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,12 @@ class Scenario:
     signals: Tuple[Signal, ...] = ()
     events: Tuple[ScriptedEvent, ...] = ()
     tick_ms: int = 100  # 固定积分步长（毫秒）
+    # 分支元数据；主场景为 None。分支的完整定义仍内聚在 Scenario 中，
+    # 因此分支存档不依赖内存中的父场景。
+    branch_id: str | None = None
+    parent_id: str | None = None
+    branch_point_ms: int | None = None
+    reaction_params: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
 
     def ordered_actors(self) -> List[Actor]:
         actors: List[Actor] = []

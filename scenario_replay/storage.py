@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .engine import EngineState, EventRecord, ReplayEngine
+from .engine import CollisionRecord, EngineState, EventRecord, ReplayEngine
 from .scenario import Pedestrian, Scenario, ScriptedEvent, Signal, Vehicle
 
 if TYPE_CHECKING:
@@ -33,6 +33,13 @@ def scenario_to_dict(scenario: Scenario) -> dict:
             }
             for e in scenario.events
         ],
+        "branch_id": scenario.branch_id,
+        "parent_id": scenario.parent_id,
+        "branch_point_ms": scenario.branch_point_ms,
+        "reaction_params": {
+            actor_id: dict(params)
+            for actor_id, params in scenario.reaction_params.items()
+        },
     }
 
 
@@ -56,6 +63,13 @@ def scenario_from_dict(data: dict) -> Scenario:
         signals=signals,
         events=events,
         tick_ms=int(data.get("tick_ms", 100)),
+        branch_id=data.get("branch_id"),
+        parent_id=data.get("parent_id"),
+        branch_point_ms=data.get("branch_point_ms"),
+        reaction_params={
+            actor_id: {k: float(v) for k, v in params.items()}
+            for actor_id, params in data.get("reaction_params", {}).items()
+        },
     )
 
 
@@ -67,7 +81,9 @@ def save_run(engine: ReplayEngine, path: str | Path) -> Path:
             "tick_ms": engine.state.tick_ms,
             "distances": engine.state.distances,
             "speeds": engine.state.speeds,
+            "speed_targets": engine.state.speed_targets,
             "signal_overrides": engine.state.signal_overrides,
+            "reaction_params": engine.state.reaction_params,
             "interrupted": engine.state.interrupted,
             "paused": engine.paused,
         },
@@ -77,8 +93,21 @@ def save_run(engine: ReplayEngine, path: str | Path) -> Path:
                 "event_id": r.event_id,
                 "order_index": r.order_index,
                 "action": r.action,
+                "reason": r.reason,
             }
             for r in engine.journal
+        ],
+        "collisions": [
+            {
+                "tick_ms": c.tick_ms,
+                "actor_a": c.actor_a,
+                "actor_b": c.actor_b,
+                "distance": c.distance,
+                "position_a": list(c.position_a),
+                "position_b": list(c.position_b),
+                "reason": c.reason,
+            }
+            for c in engine.collisions
         ],
     }
     path = Path(path)
@@ -95,7 +124,12 @@ def load_run(path: str | Path) -> ReplayEngine:
         tick_ms=int(st["tick_ms"]),
         distances={k: float(v) for k, v in st["distances"].items()},
         speeds={k: float(v) for k, v in st["speeds"].items()},
+        speed_targets={k: float(v) for k, v in st.get("speed_targets", {}).items()},
         signal_overrides=dict(st["signal_overrides"]),
+        reaction_params={
+            k: {pk: float(pv) for pk, pv in v.items()}
+            for k, v in st.get("reaction_params", {}).items()
+        },
         interrupted=bool(st["interrupted"]),
     )
     engine.paused = bool(st.get("paused", False))
@@ -105,10 +139,24 @@ def load_run(path: str | Path) -> ReplayEngine:
             event_id=r["event_id"],
             order_index=int(r["order_index"]),
             action=r["action"],
+            reason=r.get("reason"),
         )
         for r in payload["journal"]
     ]
     engine._fired = {r.event_id for r in engine.journal}
+    engine.collisions = [
+        CollisionRecord(
+            tick_ms=int(c["tick_ms"]),
+            actor_a=c["actor_a"],
+            actor_b=c["actor_b"],
+            distance=float(c["distance"]),
+            position_a=tuple(c["position_a"]),
+            position_b=tuple(c["position_b"]),
+            reason=c["reason"],
+        )
+        for c in payload.get("collisions", ())
+    ]
+    engine._collision_pairs = {c.pair for c in engine.collisions}
     return engine
 
 
@@ -117,6 +165,7 @@ def _actor_to_dict(actor) -> dict:
         "actor_id": actor.actor_id,
         "speed": actor.speed,
         "path": [[x, y] for x, y in actor.path],
+        "radius": actor.radius,
     }
 
 
@@ -125,4 +174,5 @@ def _actor_from_dict(data: dict, cls):
         actor_id=data["actor_id"],
         speed=float(data["speed"]),
         path=tuple((float(x), float(y)) for x, y in data["path"]),
+        radius=float(data.get("radius", cls.radius)),
     )

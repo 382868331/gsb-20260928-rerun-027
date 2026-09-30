@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Dict, List, Optional, Tuple
 
 from .scenario import Actor, Scenario, ScriptedEvent
@@ -24,7 +25,9 @@ class EngineState:
     tick_ms: int = 0
     distances: Dict[str, float] = field(default_factory=dict)
     speeds: Dict[str, float] = field(default_factory=dict)
+    speed_targets: Dict[str, float] = field(default_factory=dict)
     signal_overrides: Dict[str, str] = field(default_factory=dict)
+    reaction_params: Dict[str, Dict[str, float]] = field(default_factory=dict)
     interrupted: bool = False
 
     def clone(self) -> "EngineState":
@@ -32,7 +35,9 @@ class EngineState:
             tick_ms=self.tick_ms,
             distances=dict(self.distances),
             speeds=dict(self.speeds),
+            speed_targets=dict(self.speed_targets),
             signal_overrides=dict(self.signal_overrides),
+            reaction_params={k: dict(v) for k, v in self.reaction_params.items()},
             interrupted=self.interrupted,
         )
 
@@ -43,6 +48,22 @@ class EventRecord:
     event_id: str
     order_index: int  # 全局触发序号，同 tick 内反映固定顺序
     action: dict
+    reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CollisionRecord:
+    tick_ms: int
+    actor_a: str
+    actor_b: str
+    distance: float
+    position_a: Vec2
+    position_b: Vec2
+    reason: str
+
+    @property
+    def pair(self) -> Tuple[str, str]:
+        return tuple(sorted((self.actor_a, self.actor_b)))
 
 
 class ReplayEngine:
@@ -50,7 +71,9 @@ class ReplayEngine:
         self.scenario = scenario
         self.state = self._initial_state(scenario)
         self.journal: List[EventRecord] = []
+        self.collisions: List[CollisionRecord] = []
         self._fired: set[str] = set()
+        self._collision_pairs: set[Tuple[str, str]] = set()
         self.paused = False
 
     # ---- 基础查询 ----
@@ -81,6 +104,13 @@ class ReplayEngine:
     def fired_event_ids(self) -> Tuple[str, ...]:
         return tuple(r.event_id for r in self.journal)
 
+    def fired_reasons(self) -> Dict[str, Optional[str]]:
+        """事件 ID -> 触发原因；同一事件只保留首次触发。"""
+        return {r.event_id: r.reason for r in reversed(self.journal)}
+
+    def collision_at_or_before(self, tick_ms: int) -> Tuple[CollisionRecord, ...]:
+        return tuple(c for c in self.collisions if c.tick_ms <= tick_ms)
+
     # ---- 时钟控制 ----
 
     def pause(self) -> None:
@@ -95,7 +125,14 @@ class ReplayEngine:
         for _ in range(steps):
             if self.paused or self.state.interrupted:
                 break
-            self._step_once(self.state, self._fired, self.journal, new_records)
+            self._step_once(
+                self.state,
+                self._fired,
+                self.journal,
+                new_records,
+                self.collisions,
+                self._collision_pairs,
+            )
         return new_records
 
     def run_to(self, target_ms: int) -> List[EventRecord]:
@@ -109,7 +146,14 @@ class ReplayEngine:
         while self.state.tick_ms < target_ms:
             if self.paused or self.state.interrupted:
                 break
-            self._step_once(self.state, self._fired, self.journal, new_records)
+            self._step_once(
+                self.state,
+                self._fired,
+                self.journal,
+                new_records,
+                self.collisions,
+                self._collision_pairs,
+            )
         return new_records
 
     def seek(self, target_ms: int) -> None:
@@ -127,14 +171,28 @@ class ReplayEngine:
         rebuilt = self._initial_state(self.scenario)
         shadow_fired = set(self._fired)  # 旧事件：重建副作用但不再登记
         shadow_journal = list(self.journal)
+        shadow_collisions = list(self.collisions)
+        shadow_collision_pairs = set(self._collision_pairs)
+        start_tick_ms = self.state.tick_ms
         # 静默重放到目标时刻：旧事件的副作用照常应用以重建状态，
         # 但只有此前未处理过的事件才追加进日志
         while rebuilt.tick_ms < target_ms:
-            self._step_once(rebuilt, shadow_fired, shadow_journal, None)
+            self._step_once(
+                rebuilt,
+                shadow_fired,
+                shadow_journal,
+                None,
+                shadow_collisions,
+                shadow_collision_pairs,
+            )
+            if rebuilt.interrupted and start_tick_ms < rebuilt.tick_ms:
+                break
 
         self.state = rebuilt
         self.journal = shadow_journal
+        self.collisions = shadow_collisions
         self._fired = shadow_fired
+        self._collision_pairs = shadow_collision_pairs
         self.paused = False
 
     # ---- 内部实现 ----
@@ -145,15 +203,24 @@ class ReplayEngine:
         fired: set[str],
         journal: List[EventRecord],
         new_records: Optional[List[EventRecord]],
-        record_new: bool = True,
+        collisions: Optional[List[CollisionRecord]] = None,
+        collision_pairs: Optional[set[Tuple[str, str]]] = None,
     ) -> None:
+        if collisions is None:
+            collisions = self.collisions
+        if collision_pairs is None:
+            collision_pairs = self._collision_pairs
         state.tick_ms += self.scenario.tick_ms
         dt_seconds = self.scenario.tick_ms / 1000.0
 
         # 1. 固定顺序推进所有参与者（车辆在前、行人在后）
         for actor in self.scenario.ordered_actors():
-            speed = state.speeds[actor.actor_id]
-            state.distances[actor.actor_id] += speed * dt_seconds
+            target = state.speed_targets.get(actor.actor_id)
+            if target is not None:
+                self._approach_target(state, actor.actor_id, target)
+            state.distances[actor.actor_id] += state.speeds[actor.actor_id] * dt_seconds
+
+        self._detect_collisions(state, collisions, collision_pairs)
 
         # 2. 固定全序触发本 tick 的事件
         for event in self._events_at.get(state.tick_ms, ()):
@@ -164,16 +231,48 @@ class ReplayEngine:
             if already_handled:
                 continue  # 跳转后继续运行，不重复触发/登记
             fired.add(event.event_id)
-            if record_new:
-                record = EventRecord(
-                    tick_ms=state.tick_ms,
-                    event_id=event.event_id,
-                    order_index=len(journal),
-                    action=dict(event.action),
-                )
-                journal.append(record)
-                if new_records is not None:
-                    new_records.append(record)
+            reason = event.action.get("reason")
+            record = EventRecord(
+                tick_ms=state.tick_ms,
+                event_id=event.event_id,
+                order_index=len(journal),
+                action=dict(event.action),
+                reason=reason,
+            )
+            journal.append(record)
+            if new_records is not None:
+                new_records.append(record)
+
+    def _detect_collisions(
+        self,
+        state: EngineState,
+        collisions: List[CollisionRecord],
+        collision_pairs: set[Tuple[str, str]],
+    ) -> None:
+        actors = self.scenario.ordered_actors()
+        positions = {a.actor_id: a.position_at(state.distances[a.actor_id]) for a in actors}
+        for index, actor_a in enumerate(actors):
+            for actor_b in actors[index + 1 :]:
+                pair = tuple(sorted((actor_a.actor_id, actor_b.actor_id)))
+                if pair in collision_pairs:
+                    continue
+                point_a = positions[actor_a.actor_id]
+                point_b = positions[actor_b.actor_id]
+                distance = math.hypot(point_a[0] - point_b[0], point_a[1] - point_b[1])
+                if distance <= actor_a.radius + actor_b.radius:
+                    pair = tuple(pair)
+                    collision_pairs.add(pair)
+                    collisions.append(
+                        CollisionRecord(
+                            tick_ms=state.tick_ms,
+                            actor_a=pair[0],
+                            actor_b=pair[1],
+                            distance=distance,
+                            position_a=positions[pair[0]],
+                            position_b=positions[pair[1]],
+                            reason=f"{pair[0]} 与 {pair[1]} 距离小于碰撞半径之和",
+                        )
+                    )
 
     def _apply_action(self, state: EngineState, event: ScriptedEvent) -> None:
         action = event.action
@@ -181,13 +280,25 @@ class ReplayEngine:
         if kind == "set_speed":
             if action["actor_id"] not in state.speeds:
                 raise KeyError(f"unknown actor: {action['actor_id']}")
-            state.speeds[action["actor_id"]] = float(action["speed"])
+            self._change_speed(
+                state,
+                action["actor_id"],
+                float(action["speed"]),
+                rate=action.get("rate"),
+            )
         elif kind == "stop_actor":
             if action["actor_id"] not in state.speeds:
                 raise KeyError(f"unknown actor: {action['actor_id']}")
-            state.speeds[action["actor_id"]] = 0.0
+            self._change_speed(state, action["actor_id"], 0.0, rate=action.get("rate"))
         elif kind == "set_signal":
             state.signal_overrides[action["signal_id"]] = action["phase"]
+        elif kind == "set_reaction_params":
+            actor_id = action["actor_id"]
+            if actor_id not in state.reaction_params:
+                state.reaction_params[actor_id] = {}
+            state.reaction_params[actor_id].update(
+                {str(k): float(v) for k, v in action.get("params", {}).items()}
+            )
         elif kind == "pause":
             # 场景中断：事件副作用先生效，随后推进停止
             state.interrupted = True
@@ -196,12 +307,51 @@ class ReplayEngine:
         else:
             raise ValueError(f"unknown event action type: {kind!r}")
 
+    def _change_speed(
+        self,
+        state: EngineState,
+        actor_id: str,
+        target_speed: float,
+        rate: Optional[float] = None,
+    ) -> None:
+        """按车辆反应参数限速变化；未配置参数时保持原有瞬时反应。"""
+        current = state.speeds[actor_id]
+        if rate is None:
+            params = state.reaction_params.get(actor_id, {})
+            if target_speed < current and "brake_rate" in params:
+                state.speed_targets[actor_id] = target_speed
+                self._approach_target(state, actor_id, target_speed)
+                return
+            elif target_speed > current and "acceleration" in params:
+                state.speed_targets[actor_id] = target_speed
+                self._approach_target(state, actor_id, target_speed)
+                return
+        state.speed_targets.pop(actor_id, None)
+        state.speeds[actor_id] = float(target_speed)
+
+    def _approach_target(self, state: EngineState, actor_id: str, target_speed: float) -> None:
+        current = state.speeds[actor_id]
+        params = state.reaction_params.get(actor_id, {})
+        rate_key = "brake_rate" if target_speed < current else "acceleration"
+        rate = params.get(rate_key)
+        dt_seconds = self.scenario.tick_ms / 1000.0
+        if rate is None:
+            state.speeds[actor_id] = float(target_speed)
+            return
+        max_delta = float(rate) * dt_seconds
+        delta = target_speed - current
+        state.speeds[actor_id] = float(
+            target_speed if abs(delta) <= max_delta else current + math.copysign(max_delta, delta)
+        )
+
     @staticmethod
     def _initial_state(scenario: Scenario) -> EngineState:
         state = EngineState()
         for actor in scenario.ordered_actors():
             state.distances[actor.actor_id] = 0.0
             state.speeds[actor.actor_id] = actor.speed
+        for actor_id, params in getattr(scenario, "reaction_params", {}).items():
+            state.reaction_params[actor_id] = {k: float(v) for k, v in params.items()}
         return state
 
     @property
