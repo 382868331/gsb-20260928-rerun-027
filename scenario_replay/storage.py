@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .engine import EngineState, EventRecord, ReplayEngine
+from .engine import CollisionRecord, EngineState, EventRecord, ReplayEngine
 from .scenario import Pedestrian, Scenario, ScriptedEvent, Signal, Vehicle
 
 if TYPE_CHECKING:
@@ -33,6 +33,7 @@ def scenario_to_dict(scenario: Scenario) -> dict:
             }
             for e in scenario.events
         ],
+        "branch": scenario.branch,
     }
 
 
@@ -56,6 +57,7 @@ def scenario_from_dict(data: dict) -> Scenario:
         signals=signals,
         events=events,
         tick_ms=int(data.get("tick_ms", 100)),
+        branch=data.get("branch"),
     )
 
 
@@ -67,6 +69,14 @@ def save_run(engine: ReplayEngine, path: str | Path) -> Path:
             "tick_ms": engine.state.tick_ms,
             "distances": engine.state.distances,
             "speeds": engine.state.speeds,
+            "paths": {
+                actor_id: [list(point) for point in path]
+                for actor_id, path in engine.state.paths.items()
+            },
+            "signal_plans": {
+                signal_id: [list(item) for item in plan]
+                for signal_id, plan in engine.state.signal_plans.items()
+            },
             "signal_overrides": engine.state.signal_overrides,
             "interrupted": engine.state.interrupted,
             "paused": engine.paused,
@@ -79,6 +89,17 @@ def save_run(engine: ReplayEngine, path: str | Path) -> Path:
                 "action": r.action,
             }
             for r in engine.journal
+        ],
+        "collisions": [
+            {
+                "tick_ms": record.tick_ms,
+                "vehicle_id": record.vehicle_id,
+                "pedestrian_id": record.pedestrian_id,
+                "vehicle_position": list(record.vehicle_position),
+                "pedestrian_position": list(record.pedestrian_position),
+                "distance": record.distance,
+            }
+            for record in engine.collisions
         ],
     }
     path = Path(path)
@@ -95,6 +116,14 @@ def load_run(path: str | Path) -> ReplayEngine:
         tick_ms=int(st["tick_ms"]),
         distances={k: float(v) for k, v in st["distances"].items()},
         speeds={k: float(v) for k, v in st["speeds"].items()},
+        paths={
+            actor_id: tuple((float(x), float(y)) for x, y in path)
+            for actor_id, path in st.get("paths", {}).items()
+        },
+        signal_plans={
+            signal_id: tuple((int(tick), str(phase)) for tick, phase in plan)
+            for signal_id, plan in st.get("signal_plans", {}).items()
+        },
         signal_overrides=dict(st["signal_overrides"]),
         interrupted=bool(st["interrupted"]),
     )
@@ -109,6 +138,22 @@ def load_run(path: str | Path) -> ReplayEngine:
         for r in payload["journal"]
     ]
     engine._fired = {r.event_id for r in engine.journal}
+    engine.collisions = [
+        CollisionRecord(
+            tick_ms=int(record["tick_ms"]),
+            vehicle_id=record["vehicle_id"],
+            pedestrian_id=record["pedestrian_id"],
+            vehicle_position=tuple(float(v) for v in record["vehicle_position"]),
+            pedestrian_position=tuple(
+                float(v) for v in record["pedestrian_position"]
+            ),
+            distance=float(record["distance"]),
+        )
+        for record in payload.get("collisions", [])
+    ]
+    engine._collided_pairs = {
+        (record.vehicle_id, record.pedestrian_id) for record in engine.collisions
+    }
     return engine
 
 

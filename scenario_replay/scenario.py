@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 Vec2 = Tuple[float, float]
 
@@ -83,6 +83,9 @@ class Scenario:
     signals: Tuple[Signal, ...] = ()
     events: Tuple[ScriptedEvent, ...] = ()
     tick_ms: int = 100  # 固定积分步长（毫秒）
+    # 分支元数据：{"name": ..., "parent": ..., "branch_tick_ms": ...}；
+    # 原始场景为 None。分支场景本身是完整自足的场景定义。
+    branch: Optional[dict] = None
 
     def ordered_actors(self) -> List[Actor]:
         actors: List[Actor] = []
