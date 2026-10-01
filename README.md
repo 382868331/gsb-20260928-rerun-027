@@ -25,6 +25,25 @@
   碰撞集合/原因与事件触发原因。
 - 差异定位：first_divergence(a, b, until_ms) 逐 tick 对比两个分支，
   返回第一处行为差异（时刻、维度与涉及的车辆/信号灯）。
+- 反应延迟实验：ReactionScheme(vehicle_id, delay_ms, action, signal_id=/lead_id=)
+  让选定车辆在看见信号变化或前车制动后延迟 delay_ms 才响应。感知事实
+  （engine.perceptions）与实际响应动作（事件日志中 react: 前缀的记录）
+  分离记录；延迟期间车辆照常推进，而不是把车辆晚生成。感知尚未触发
+  动作时保存/中断，恢复后仍在原定时刻响应（响应时刻是感知时刻+delay_ms
+  的绝对时刻，不随中断平移）。
+- 同刻多刺激：按 scenario.reaction_schemes 定义顺序逐车处理，同车先
+  信号变化后前车制动；新感知产生的决定替代该车尚未执行的待响应动作，
+  被替代者标记 superseded 保留记录但不再执行。
+- 反应方案分支：BranchChanges(reaction_schemes=..., exit_vehicles=...)
+  从共同历史派生多个反应方案。分支点之前已发生的感知事实与已安排的
+  待响应动作原样保留——分支中更改信号安排只影响尚未发生的感知，不能
+  回写车辆已经看到的事实；exit_vehicles / {"type": "exit_actor"} 事件
+  让车辆退出，其待响应动作取消且不再执行。回跳重放、再次分支后，待响应
+  动作不重复执行，也不泄漏到其他方案（各分支状态独立克隆）。
+- 方案对比：first_response_difference(a, b, until_ms) 定位两个方案
+  感知/响应的第一处差异；minimum_gap(engine, a, b, until_ms) 给出区间
+  最小间距；event_chain_before(engine, t) 合并冲突发生前的感知、动作
+  与碰撞为一条全序事件链。
 
 ## 用法示例
 

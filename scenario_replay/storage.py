@@ -5,8 +5,22 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .engine import CollisionRecord, EngineState, EventRecord, ReplayEngine
-from .scenario import Pedestrian, Scenario, ScriptedEvent, Signal, Vehicle
+from .engine import (
+    CollisionRecord,
+    EngineState,
+    EventRecord,
+    PendingResponse,
+    PerceptionRecord,
+    ReplayEngine,
+)
+from .scenario import (
+    Pedestrian,
+    ReactionScheme,
+    Scenario,
+    ScriptedEvent,
+    Signal,
+    Vehicle,
+)
 
 if TYPE_CHECKING:
     pass
@@ -33,6 +47,16 @@ def scenario_to_dict(scenario: Scenario) -> dict:
             }
             for e in scenario.events
         ],
+        "reaction_schemes": [
+            {
+                "vehicle_id": s.vehicle_id,
+                "delay_ms": s.delay_ms,
+                "action": s.action,
+                "signal_id": s.signal_id,
+                "lead_id": s.lead_id,
+            }
+            for s in scenario.reaction_schemes
+        ],
         "branch_id": scenario.branch_id,
         "parent_id": scenario.parent_id,
         "branch_point_ms": scenario.branch_point_ms,
@@ -54,6 +78,16 @@ def scenario_from_dict(data: dict) -> Scenario:
         ScriptedEvent(e["event_id"], e["tick_ms"], e["action"], e.get("seq", 0))
         for e in data["events"]
     )
+    reaction_schemes = tuple(
+        ReactionScheme(
+            vehicle_id=s["vehicle_id"],
+            delay_ms=int(s["delay_ms"]),
+            action=dict(s["action"]),
+            signal_id=s.get("signal_id"),
+            lead_id=s.get("lead_id"),
+        )
+        for s in data.get("reaction_schemes", ())
+    )
     return Scenario(
         name=data["name"],
         version=data["version"],
@@ -63,6 +97,7 @@ def scenario_from_dict(data: dict) -> Scenario:
         signals=signals,
         events=events,
         tick_ms=int(data.get("tick_ms", 100)),
+        reaction_schemes=reaction_schemes,
         branch_id=data.get("branch_id"),
         parent_id=data.get("parent_id"),
         branch_point_ms=data.get("branch_point_ms"),
@@ -86,6 +121,32 @@ def save_run(engine: ReplayEngine, path: str | Path) -> Path:
             "reaction_params": engine.state.reaction_params,
             "interrupted": engine.state.interrupted,
             "paused": engine.paused,
+            "perceptions": [
+                {
+                    "tick_ms": p.tick_ms,
+                    "vehicle_id": p.vehicle_id,
+                    "stimulus": p.stimulus,
+                    "detail": p.detail,
+                    "order_index": p.order_index,
+                }
+                for p in engine.state.perceptions
+            ],
+            "responses": [
+                {
+                    "response_id": r.response_id,
+                    "vehicle_id": r.vehicle_id,
+                    "perceive_tick_ms": r.perceive_tick_ms,
+                    "respond_tick_ms": r.respond_tick_ms,
+                    "delay_ms": r.delay_ms,
+                    "action": r.action,
+                    "stimulus": r.stimulus,
+                    "detail": r.detail,
+                    "status": r.status,
+                }
+                for r in engine.state.responses
+            ],
+            "perceived_phases": engine.state.perceived_phases,
+            "exited": sorted(engine.state.exited),
         },
         "journal": [
             {
@@ -131,6 +192,34 @@ def load_run(path: str | Path) -> ReplayEngine:
             for k, v in st.get("reaction_params", {}).items()
         },
         interrupted=bool(st["interrupted"]),
+        perceptions=[
+            PerceptionRecord(
+                tick_ms=int(p["tick_ms"]),
+                vehicle_id=p["vehicle_id"],
+                stimulus=p["stimulus"],
+                detail=p["detail"],
+                order_index=int(p["order_index"]),
+            )
+            for p in st.get("perceptions", ())
+        ],
+        responses=[
+            PendingResponse(
+                response_id=r["response_id"],
+                vehicle_id=r["vehicle_id"],
+                perceive_tick_ms=int(r["perceive_tick_ms"]),
+                respond_tick_ms=int(r["respond_tick_ms"]),
+                delay_ms=int(r["delay_ms"]),
+                action=dict(r["action"]),
+                stimulus=r["stimulus"],
+                detail=r["detail"],
+                status=r.get("status", "pending"),
+            )
+            for r in st.get("responses", ())
+        ],
+        perceived_phases={
+            k: dict(v) for k, v in st.get("perceived_phases", {}).items()
+        },
+        exited=set(st.get("exited", ())),
     )
     engine.paused = bool(st.get("paused", False))
     engine.journal = [

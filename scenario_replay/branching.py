@@ -12,6 +12,7 @@ from typing import Mapping, Optional, Tuple
 from .engine import CollisionRecord, EngineState, EventRecord, ReplayEngine
 from .scenario import (
     Pedestrian,
+    ReactionScheme,
     Scenario,
     ScriptedEvent,
     Signal,
@@ -26,6 +27,11 @@ class BranchChanges:
     pedestrian_speeds: Mapping[str, float] = field(default_factory=dict)
     signal_plans: Mapping[str, Tuple[Tuple[int, str], ...]] = field(default_factory=dict)
     vehicle_reaction_params: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+    # 车辆反应方案（感知-延迟-响应），按车辆替换；分支点之前已发生的
+    # 感知事实与已安排的待响应动作保留，新方案只影响尚未发生的感知。
+    reaction_schemes: Mapping[str, ReactionScheme] = field(default_factory=dict)
+    # 分支点退出的车辆：不再推进，其待响应动作取消且不泄漏到本分支
+    exit_vehicles: Tuple[str, ...] = ()
     extra_events: Tuple[ScriptedEvent, ...] = ()
     drop_event_ids: Tuple[str, ...] = ()
 
@@ -109,6 +115,21 @@ def branch_from(
     for actor_id in changes.vehicle_reaction_params:
         if actor_id not in known_vehicles:
             raise KeyError(f"unknown vehicle: {actor_id}")
+    for actor_id, scheme in changes.reaction_schemes.items():
+        if actor_id not in known_vehicles:
+            raise KeyError(f"unknown vehicle: {actor_id}")
+        if scheme.vehicle_id != actor_id:
+            raise ValueError("reaction scheme vehicle_id must match its mapping key")
+    for actor_id in changes.exit_vehicles:
+        if actor_id not in known_vehicles:
+            raise KeyError(f"unknown vehicle: {actor_id}")
+
+    replaced_schemes = set(changes.reaction_schemes)
+    reaction_schemes = tuple(
+        scheme
+        for scheme in source.reaction_schemes
+        if scheme.vehicle_id not in replaced_schemes
+    ) + tuple(changes.reaction_schemes.values())
 
     scenario = Scenario(
         name=source.name,
@@ -119,6 +140,7 @@ def branch_from(
         signals=tuple(signals),
         events=tuple(branch_events),
         tick_ms=source.tick_ms,
+        reaction_schemes=reaction_schemes,
         branch_id=branch_id,
         parent_id=source.branch_id or source.name,
         branch_point_ms=branch_point,
@@ -127,6 +149,13 @@ def branch_from(
 
     branch = ReplayEngine(scenario)
     branch.state = _clone_branch_state(engine.state, changes)
+    # 分支点退出车辆：其待响应动作取消，不会在分支中执行
+    for actor_id in changes.exit_vehicles:
+        branch.state.exited.add(actor_id)
+        branch.state.speed_targets.pop(actor_id, None)
+        for response in branch.state.responses:
+            if response.vehicle_id == actor_id and response.status == "pending":
+                response.status = "cancelled"
     # 事件归属：分支点及之前的记录是共享事实，原样保留；
     # 父场景在分支点之后触发的事件不属于本分支，不得带入。
     branch.journal = [

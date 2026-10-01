@@ -1,6 +1,18 @@
 """确定性自动驾驶场景回放系统。"""
-from .scenario import Scenario, Vehicle, Pedestrian, Signal, ScriptedEvent
-from .engine import ReplayEngine, EngineState
+from .scenario import (
+    ReactionScheme,
+    Scenario,
+    Vehicle,
+    Pedestrian,
+    Signal,
+    ScriptedEvent,
+)
+from .engine import (
+    EngineState,
+    PendingResponse,
+    PerceptionRecord,
+    ReplayEngine,
+)
 from .storage import save_run, load_run
 from .branching import BranchChanges, branch_from
 from .comparison import (
@@ -10,6 +22,14 @@ from .comparison import (
     compare_at,
     first_divergence,
 )
+from .reaction import (
+    ChainEntry,
+    GapRecord,
+    ResponseDifference,
+    event_chain_before,
+    first_response_difference,
+    minimum_gap,
+)
 
 __all__ = [
     "Scenario",
@@ -17,8 +37,11 @@ __all__ = [
     "Pedestrian",
     "Signal",
     "ScriptedEvent",
+    "ReactionScheme",
     "ReplayEngine",
     "EngineState",
+    "PerceptionRecord",
+    "PendingResponse",
     "save_run",
     "load_run",
     "BranchChanges",
@@ -28,4 +51,10 @@ __all__ = [
     "compare_at",
     "Divergence",
     "first_divergence",
+    "ChainEntry",
+    "GapRecord",
+    "ResponseDifference",
+    "event_chain_before",
+    "first_response_difference",
+    "minimum_gap",
 ]

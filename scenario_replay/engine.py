@@ -11,7 +11,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from typing import Dict, List, Optional, Tuple
 
@@ -29,6 +29,12 @@ class EngineState:
     signal_overrides: Dict[str, str] = field(default_factory=dict)
     reaction_params: Dict[str, Dict[str, float]] = field(default_factory=dict)
     interrupted: bool = False
+    # 感知事实与待响应动作：与事件日志分离记录，随状态一起
+    # 克隆/保存/重建，因此 seek 静默重放能确定性地还原。
+    perceptions: List["PerceptionRecord"] = field(default_factory=list)
+    responses: List["PendingResponse"] = field(default_factory=list)
+    perceived_phases: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    exited: set = field(default_factory=set)
 
     def clone(self) -> "EngineState":
         return EngineState(
@@ -39,7 +45,41 @@ class EngineState:
             signal_overrides=dict(self.signal_overrides),
             reaction_params={k: dict(v) for k, v in self.reaction_params.items()},
             interrupted=self.interrupted,
+            perceptions=list(self.perceptions),
+            responses=[replace(r) for r in self.responses],
+            perceived_phases={k: dict(v) for k, v in self.perceived_phases.items()},
+            exited=set(self.exited),
         )
+
+
+@dataclass(frozen=True)
+class PerceptionRecord:
+    """车辆看到的刺激事实；与实际响应动作分开记录。"""
+
+    tick_ms: int
+    vehicle_id: str
+    stimulus: str  # "signal_phase" / "lead_brake"
+    detail: str
+    order_index: int  # 全局感知序号，同 tick 内反映固定处理顺序
+
+
+@dataclass
+class PendingResponse:
+    """已感知、尚未到原定响应时刻的动作。
+
+    status: pending（等待响应）/ superseded（被同车后续决定替代，不再执行）
+    / executed / cancelled（车辆退出，不再执行）。
+    """
+
+    response_id: str
+    vehicle_id: str
+    perceive_tick_ms: int
+    respond_tick_ms: int
+    delay_ms: int
+    action: dict
+    stimulus: str
+    detail: str
+    status: str = "pending"
 
 
 @dataclass(frozen=True)
@@ -93,10 +133,7 @@ class ReplayEngine:
         return {aid: self.position_of(aid) for aid in self._actors_by_id}
 
     def signal_phase(self, signal_id: str) -> str:
-        if signal_id in self.state.signal_overrides:
-            return self.state.signal_overrides[signal_id]
-        sig = self._signals_by_id[signal_id]
-        return sig.phase_at(self.state.tick_ms)
+        return self._phase_at(self.state, signal_id)
 
     def signal_phases(self) -> Dict[str, str]:
         return {sid: self.signal_phase(sid) for sid in self._signals_by_id}
@@ -107,6 +144,21 @@ class ReplayEngine:
     def fired_reasons(self) -> Dict[str, Optional[str]]:
         """事件 ID -> 触发原因；同一事件只保留首次触发。"""
         return {r.event_id: r.reason for r in reversed(self.journal)}
+
+    @property
+    def perceptions(self) -> Tuple[PerceptionRecord, ...]:
+        """已发生的感知事实（与实际响应动作分离记录）。"""
+        return tuple(self.state.perceptions)
+
+    @property
+    def pending_responses(self) -> Tuple[PendingResponse, ...]:
+        """仍在等待原定时刻响应的动作。"""
+        return tuple(r for r in self.state.responses if r.status == "pending")
+
+    @property
+    def superseded_responses(self) -> Tuple[PendingResponse, ...]:
+        """被同车后续决定替代、不再执行的待响应动作（保留记录）。"""
+        return tuple(r for r in self.state.responses if r.status == "superseded")
 
     def collision_at_or_before(self, tick_ms: int) -> Tuple[CollisionRecord, ...]:
         return tuple(c for c in self.collisions if c.tick_ms <= tick_ms)
@@ -212,9 +264,12 @@ class ReplayEngine:
             collision_pairs = self._collision_pairs
         state.tick_ms += self.scenario.tick_ms
         dt_seconds = self.scenario.tick_ms / 1000.0
+        speeds_before = dict(state.speeds)
 
         # 1. 固定顺序推进所有参与者（车辆在前、行人在后）
         for actor in self.scenario.ordered_actors():
+            if actor.actor_id in state.exited:
+                continue  # 已退出场景的车辆不再推进
             target = state.speed_targets.get(actor.actor_id)
             if target is not None:
                 self._approach_target(state, actor.actor_id, target)
@@ -243,6 +298,114 @@ class ReplayEngine:
             if new_records is not None:
                 new_records.append(record)
 
+        # 3. 先执行本 tick 到期的待响应动作：感知时刻+delay 的原定时刻
+        #    优先于同 tick 的新感知（新决定只替代尚未到期的待响应）。
+        self._execute_due_responses(state, fired, journal, new_records)
+
+        # 4. 感知：车辆看到信号变化/前车制动，记录事实并安排延迟响应
+        self._process_perceptions(state, speeds_before)
+
+        # 5. 零延迟的响应（感知与响应同 tick）在此执行
+        self._execute_due_responses(state, fired, journal, new_records)
+
+    def _process_perceptions(self, state: EngineState, speeds_before: Dict[str, float]) -> None:
+        """按固定顺序检测刺激并登记感知。
+
+        顺序约定：按 scenario.reaction_schemes 的定义顺序逐车处理；
+        同一车辆同刻的多个刺激先信号变化、后前车制动。新感知产生的
+        决定会替代该车此前尚未执行的待响应动作（标记 superseded，
+        记录保留但不再执行）。
+        """
+        for scheme in self.scenario.reaction_schemes:
+            vehicle_id = scheme.vehicle_id
+            if vehicle_id in state.exited:
+                continue
+            stimuli: List[Tuple[str, str]] = []
+            if scheme.signal_id is not None:
+                phase = self._phase_at(state, scheme.signal_id)
+                seen = state.perceived_phases.setdefault(vehicle_id, {})
+                last = seen.get(scheme.signal_id, phase)
+                if phase != last:
+                    stimuli.append(
+                        ("signal_phase", f"信号 {scheme.signal_id} 由 {last} 变为 {phase}")
+                    )
+                seen[scheme.signal_id] = phase
+            if scheme.lead_id is not None and scheme.lead_id not in state.exited:
+                lead = scheme.lead_id
+                if state.speeds.get(lead, 0.0) < speeds_before.get(lead, 0.0) - 1e-12:
+                    stimuli.append(("lead_brake", f"前车 {lead} 制动"))
+            for stimulus, detail in stimuli:
+                self._record_perception(state, scheme, stimulus, detail)
+
+    def _record_perception(
+        self, state: EngineState, scheme, stimulus: str, detail: str
+    ) -> None:
+        vehicle_id = scheme.vehicle_id
+        state.perceptions.append(
+            PerceptionRecord(
+                tick_ms=state.tick_ms,
+                vehicle_id=vehicle_id,
+                stimulus=stimulus,
+                detail=detail,
+                order_index=len(state.perceptions),
+            )
+        )
+        # 同车此前尚未执行的待响应被后续决定替代
+        for response in state.responses:
+            if response.vehicle_id == vehicle_id and response.status == "pending":
+                response.status = "superseded"
+        response_id = f"react:{vehicle_id}:{state.tick_ms}:{len(state.responses)}"
+        action = dict(scheme.action)
+        action.setdefault("actor_id", vehicle_id)
+        state.responses.append(
+            PendingResponse(
+                response_id=response_id,
+                vehicle_id=vehicle_id,
+                perceive_tick_ms=state.tick_ms,
+                respond_tick_ms=state.tick_ms + int(scheme.delay_ms),
+                delay_ms=int(scheme.delay_ms),
+                action=action,
+                stimulus=stimulus,
+                detail=detail,
+            )
+        )
+
+    def _execute_due_responses(
+        self,
+        state: EngineState,
+        fired: set[str],
+        journal: List[EventRecord],
+        new_records: Optional[List[EventRecord]],
+    ) -> None:
+        for response in state.responses:
+            if response.status != "pending" or response.respond_tick_ms != state.tick_ms:
+                continue
+            if response.vehicle_id in state.exited:
+                response.status = "cancelled"  # 车辆已退出：不再执行
+                continue
+            response.status = "executed"
+            action = dict(response.action)
+            action.setdefault(
+                "reason",
+                f"{response.detail}，延迟 {response.delay_ms}ms 后响应",
+            )
+            pseudo = ScriptedEvent(response.response_id, state.tick_ms, action)
+            # 与脚本事件一致：重放时副作用始终应用，但不重复登记
+            self._apply_action(state, pseudo)
+            if response.response_id in fired:
+                continue
+            fired.add(response.response_id)
+            record = EventRecord(
+                tick_ms=state.tick_ms,
+                event_id=response.response_id,
+                order_index=len(journal),
+                action=action,
+                reason=action.get("reason"),
+            )
+            journal.append(record)
+            if new_records is not None:
+                new_records.append(record)
+
     def _detect_collisions(
         self,
         state: EngineState,
@@ -250,6 +413,7 @@ class ReplayEngine:
         collision_pairs: set[Tuple[str, str]],
     ) -> None:
         actors = self.scenario.ordered_actors()
+        actors = [a for a in actors if a.actor_id not in state.exited]
         positions = {a.actor_id: a.position_at(state.distances[a.actor_id]) for a in actors}
         for index, actor_a in enumerate(actors):
             for actor_b in actors[index + 1 :]:
@@ -304,6 +468,16 @@ class ReplayEngine:
             state.interrupted = True
         elif kind == "resume":
             state.interrupted = False
+        elif kind == "exit_actor":
+            # 车辆退出场景：不再推进/参与碰撞，待响应动作取消且不再执行
+            actor_id = action["actor_id"]
+            if actor_id not in state.speeds:
+                raise KeyError(f"unknown actor: {actor_id}")
+            state.exited.add(actor_id)
+            state.speed_targets.pop(actor_id, None)
+            for response in state.responses:
+                if response.vehicle_id == actor_id and response.status == "pending":
+                    response.status = "cancelled"
         else:
             raise ValueError(f"unknown event action type: {kind!r}")
 
@@ -352,7 +526,17 @@ class ReplayEngine:
             state.speeds[actor.actor_id] = actor.speed
         for actor_id, params in getattr(scenario, "reaction_params", {}).items():
             state.reaction_params[actor_id] = {k: float(v) for k, v in params.items()}
+        signals = {s.signal_id: s for s in scenario.signals}
+        for scheme in getattr(scenario, "reaction_schemes", ()):
+            if scheme.signal_id is not None:
+                seen = state.perceived_phases.setdefault(scheme.vehicle_id, {})
+                seen[scheme.signal_id] = signals[scheme.signal_id].phase_at(0)
         return state
+
+    def _phase_at(self, state: EngineState, signal_id: str) -> str:
+        if signal_id in state.signal_overrides:
+            return state.signal_overrides[signal_id]
+        return self._signals_by_id[signal_id].phase_at(state.tick_ms)
 
     @property
     def _actors_by_id(self) -> Dict[str, Actor]:

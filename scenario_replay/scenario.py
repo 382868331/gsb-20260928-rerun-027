@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Mapping, Tuple
+from typing import List, Mapping, Optional, Tuple
 
 Vec2 = Tuple[float, float]
 
@@ -76,6 +76,24 @@ class ScriptedEvent:
 
 
 @dataclass(frozen=True)
+class ReactionScheme:
+    """驾驶员反应方案：车辆感知到刺激后延迟 delay_ms 才执行 action。
+
+    刺激来源二选一（也可同时配置，同刻按固定顺序处理）：
+    * signal_id：观察信号灯相位变化；
+    * lead_id：观察前车制动（速度下降）。
+    延迟通过"先记录感知、到原定时刻再响应"实现，
+    而不是把车辆推迟生成——延迟期间车辆照常推进。
+    """
+
+    vehicle_id: str
+    delay_ms: int
+    action: dict  # 响应动作，如 {"type": "stop_actor"} 或 {"type": "set_speed", "speed": 2.0}
+    signal_id: Optional[str] = None
+    lead_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class Scenario:
     name: str
     version: str
@@ -86,6 +104,8 @@ class Scenario:
     signals: Tuple[Signal, ...] = ()
     events: Tuple[ScriptedEvent, ...] = ()
     tick_ms: int = 100  # 固定积分步长（毫秒）
+    # 车辆反应方案（感知-延迟-响应）；运行时的感知与待响应状态由引擎承载
+    reaction_schemes: Tuple[ReactionScheme, ...] = ()
     # 分支元数据；主场景为 None。分支的完整定义仍内聚在 Scenario 中，
     # 因此分支存档不依赖内存中的父场景。
     branch_id: str | None = None
