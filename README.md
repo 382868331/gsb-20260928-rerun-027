@@ -25,6 +25,14 @@
   碰撞集合/原因与事件触发原因。
 - 差异定位：first_divergence(a, b, until_ms) 逐 tick 对比两个分支，
   返回第一处行为差异（时刻、维度与涉及的车辆/信号灯）。
+- 反应延迟分支：BranchChanges.vehicle_reaction_delays 为选定车辆设置
+  `signal_red`、`signal_green`、`lead_brake` 等刺激的延迟（毫秒）。
+  PerceptionRecord 记录感知时刻与事实，ResponseRecord 记录原定触发/到期
+  时刻、动作及 `scheduled/executed/superseded/cancelled/ignored` 状态；
+  待执行动作保存并恢复后仍在原到期时刻执行，回跳与再次分支不会重复执行。
+- 反应方案比较：first_response_comparison 比较首感和首响应，
+  minimum_gap_between 统计最小间距，conflict_event_chain 汇总冲突前的
+  感知、响应和脚本事件链。
 
 ## 用法示例
 

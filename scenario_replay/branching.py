@@ -26,6 +26,7 @@ class BranchChanges:
     pedestrian_speeds: Mapping[str, float] = field(default_factory=dict)
     signal_plans: Mapping[str, Tuple[Tuple[int, str], ...]] = field(default_factory=dict)
     vehicle_reaction_params: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+    vehicle_reaction_delays: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
     extra_events: Tuple[ScriptedEvent, ...] = ()
     drop_event_ids: Tuple[str, ...] = ()
 
@@ -109,6 +110,22 @@ def branch_from(
     for actor_id in changes.vehicle_reaction_params:
         if actor_id not in known_vehicles:
             raise KeyError(f"unknown vehicle: {actor_id}")
+    for actor_id in changes.vehicle_reaction_delays:
+        if actor_id not in known_vehicles:
+            raise KeyError(f"unknown vehicle: {actor_id}")
+
+    reaction_params = {
+        actor_id: dict(params)
+        for actor_id, params in engine.state.reaction_params.items()
+    }
+    for actor_id, params in changes.vehicle_reaction_params.items():
+        reaction_params.setdefault(actor_id, {}).update(params)
+    reaction_delays = {
+        actor_id: dict(delays)
+        for actor_id, delays in engine.state.reaction_delays.items()
+    }
+    for actor_id, delays in changes.vehicle_reaction_delays.items():
+        reaction_delays.setdefault(actor_id, {}).update(delays)
 
     scenario = Scenario(
         name=source.name,
@@ -122,7 +139,8 @@ def branch_from(
         branch_id=branch_id,
         parent_id=source.branch_id or source.name,
         branch_point_ms=branch_point,
-        reaction_params={k: dict(v) for k, v in changes.vehicle_reaction_params.items()},
+        reaction_params=reaction_params,
+        reaction_delays=reaction_delays,
     )
 
     branch = ReplayEngine(scenario)
@@ -161,6 +179,22 @@ def branch_from(
         for record in engine.collisions
         if record.tick_ms <= branch_point
     ]
+    branch.perceptions = [
+        _clone_perception(record)
+        for record in engine.perception_records()
+        if record.tick_ms <= branch_point
+    ]
+    branch.responses = [
+        record.clone()
+        for record in engine.response_records()
+        if record.trigger_tick_ms <= branch_point
+    ]
+    branch._handled_perceptions = {
+        record.perception_id for record in branch.perceptions
+    }
+    branch._handled_responses = {
+        record.response_id for record in branch.responses
+    }
     branch._collision_pairs = {record.pair for record in branch.collisions}
     branch.paused = False
     return branch
@@ -205,8 +239,10 @@ def _replace_signal(
 ) -> Signal:
     if new_phases is None:
         return signal
+    current_phase = engine.signal_phase(signal.signal_id)
     phases = [(start, phase) for start, phase in signal.phases if start < branch_point]
-    phases.append((branch_point, engine.signal_phase(signal.signal_id)))
+    if not phases or phases[-1][1] != current_phase:
+        phases.append((branch_point, current_phase))
     for start, phase in new_phases:
         if start < branch_point:
             raise ValueError("signal plan changes cannot occur before the branch point")
@@ -226,7 +262,26 @@ def _clone_branch_state(state: EngineState, changes: BranchChanges) -> EngineSta
     cloned = state.clone()
     for actor_id, params in changes.vehicle_reaction_params.items():
         cloned.reaction_params.setdefault(actor_id, {}).update(params)
+    for actor_id, delays in changes.vehicle_reaction_delays.items():
+        cloned.reaction_delays.setdefault(actor_id, {}).update(delays)
     return cloned
+
+
+def _clone_perception(record) -> object:
+    from .engine import PerceptionRecord
+
+    return PerceptionRecord(
+        perception_id=record.perception_id,
+        tick_ms=record.tick_ms,
+        vehicle_id=record.vehicle_id,
+        stimulus=record.stimulus,
+        source_id=record.source_id,
+        observed=dict(record.observed),
+        response_id=record.response_id,
+        order_index=record.order_index,
+        seq=record.seq,
+        supersedes_response_id=record.supersedes_response_id,
+    )
 
 
 def _clone_collision(record: CollisionRecord) -> CollisionRecord:

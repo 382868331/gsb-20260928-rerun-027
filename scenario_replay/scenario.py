@@ -92,6 +92,9 @@ class Scenario:
     parent_id: str | None = None
     branch_point_ms: int | None = None
     reaction_params: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+    # 车辆针对各类感知刺激的响应延迟（毫秒）。感知事实按发生时刻记录，
+    # 实际动作在 due_ms = 感知时刻 + delay 时才执行。
+    reaction_delays: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
 
     def ordered_actors(self) -> List[Actor]:
         actors: List[Actor] = []

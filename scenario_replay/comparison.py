@@ -124,6 +124,50 @@ def compare_at(engine_a: ReplayEngine, engine_b: ReplayEngine, tick_ms: int) -> 
     )
 
 
+def first_response_comparison(
+    engine_a: ReplayEngine,
+    engine_b: ReplayEngine,
+    until_ms: int,
+    vehicle_id: str,
+    stimulus: Optional[str] = None,
+) -> Dict[str, Optional[object]]:
+    """比较两个方案中同一车辆的首个感知与实际响应时刻。"""
+    engine_a.seek(until_ms)
+    engine_b.seek(until_ms)
+
+    def snapshot(engine: ReplayEngine) -> Dict[str, Optional[object]]:
+        perception = next(
+            (
+                record
+                for record in engine.perception_records()
+                if record.vehicle_id == vehicle_id
+                and (stimulus is None or record.stimulus == stimulus)
+            ),
+            None,
+        )
+        response = next(
+            (
+                record
+                for record in engine.response_records()
+                if record.vehicle_id == vehicle_id
+                and (stimulus is None or record.stimulus == stimulus)
+            ),
+            None,
+        )
+        return {
+            "perception_tick_ms": perception.tick_ms if perception else None,
+            "response": response,
+            "trigger_tick_ms": response.trigger_tick_ms if response else None,
+            "due_tick_ms": response.due_tick_ms if response else None,
+            "delay_ms": response.due_tick_ms - response.trigger_tick_ms if response else None,
+        }
+
+    return {
+        "a": snapshot(engine_a),
+        "b": snapshot(engine_b),
+    }
+
+
 def _collision_snapshot(engine: ReplayEngine, tick_ms: int) -> CollisionSnapshot:
     records: Tuple[CollisionRecord, ...] = tuple(
         record for record in engine.collisions if record.tick_ms <= tick_ms

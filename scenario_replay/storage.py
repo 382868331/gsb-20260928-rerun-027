@@ -5,7 +5,14 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .engine import CollisionRecord, EngineState, EventRecord, ReplayEngine
+from .engine import (
+    CollisionRecord,
+    EngineState,
+    EventRecord,
+    PerceptionRecord,
+    ReplayEngine,
+    ResponseRecord,
+)
 from .scenario import Pedestrian, Scenario, ScriptedEvent, Signal, Vehicle
 
 if TYPE_CHECKING:
@@ -40,6 +47,10 @@ def scenario_to_dict(scenario: Scenario) -> dict:
             actor_id: dict(params)
             for actor_id, params in scenario.reaction_params.items()
         },
+        "reaction_delays": {
+            actor_id: dict(delays)
+            for actor_id, delays in scenario.reaction_delays.items()
+        },
     }
 
 
@@ -70,6 +81,10 @@ def scenario_from_dict(data: dict) -> Scenario:
             actor_id: {k: float(v) for k, v in params.items()}
             for actor_id, params in data.get("reaction_params", {}).items()
         },
+        reaction_delays={
+            actor_id: {k: float(v) for k, v in delays.items()}
+            for actor_id, delays in data.get("reaction_delays", {}).items()
+        },
     )
 
 
@@ -84,6 +99,28 @@ def save_run(engine: ReplayEngine, path: str | Path) -> Path:
             "speed_targets": engine.state.speed_targets,
             "signal_overrides": engine.state.signal_overrides,
             "reaction_params": engine.state.reaction_params,
+            "reaction_delays": engine.state.reaction_delays,
+            "observed_signal_phases": engine.state.observed_signal_phases,
+            "observed_speeds": engine.state.observed_speeds,
+            "active_actors": engine.state.active_actors,
+            "pending_responses": [
+                {
+                    "response_id": r.response_id,
+                    "vehicle_id": r.vehicle_id,
+                    "stimulus": r.stimulus,
+                    "source_id": r.source_id,
+                    "trigger_tick_ms": r.trigger_tick_ms,
+                    "due_tick_ms": r.due_tick_ms,
+                    "action": r.action,
+                    "status": r.status,
+                    "order_index": r.order_index,
+                    "perception_id": r.perception_id,
+                    "superseded_by": r.superseded_by,
+                    "reason": r.reason,
+                }
+                for r in engine.state.pending_responses
+                if r.status == "scheduled"
+            ],
             "interrupted": engine.state.interrupted,
             "paused": engine.paused,
         },
@@ -109,6 +146,38 @@ def save_run(engine: ReplayEngine, path: str | Path) -> Path:
             }
             for c in engine.collisions
         ],
+        "perceptions": [
+            {
+                "perception_id": p.perception_id,
+                "tick_ms": p.tick_ms,
+                "vehicle_id": p.vehicle_id,
+                "stimulus": p.stimulus,
+                "source_id": p.source_id,
+                "observed": p.observed,
+                "response_id": p.response_id,
+                "order_index": p.order_index,
+                "seq": p.seq,
+                "supersedes_response_id": p.supersedes_response_id,
+            }
+            for p in engine.perceptions
+        ],
+        "responses": [
+            {
+                "response_id": r.response_id,
+                "vehicle_id": r.vehicle_id,
+                "stimulus": r.stimulus,
+                "source_id": r.source_id,
+                "trigger_tick_ms": r.trigger_tick_ms,
+                "due_tick_ms": r.due_tick_ms,
+                "action": r.action,
+                "status": r.status,
+                "order_index": r.order_index,
+                "perception_id": r.perception_id,
+                "superseded_by": r.superseded_by,
+                "reason": r.reason,
+            }
+            for r in engine.responses
+        ],
     }
     path = Path(path)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -129,6 +198,18 @@ def load_run(path: str | Path) -> ReplayEngine:
         reaction_params={
             k: {pk: float(pv) for pk, pv in v.items()}
             for k, v in st.get("reaction_params", {}).items()
+        },
+        reaction_delays={
+            k: {pk: float(pv) for pk, pv in v.items()}
+            for k, v in st.get("reaction_delays", {}).items()
+        },
+        observed_signal_phases=dict(st.get("observed_signal_phases", {})),
+        observed_speeds={k: float(v) for k, v in st.get("observed_speeds", {}).items()},
+        active_actors={
+            actor.actor_id: bool(
+                st.get("active_actors", {}).get(actor.actor_id, True)
+            )
+            for actor in scenario.ordered_actors()
         },
         interrupted=bool(st["interrupted"]),
     )
@@ -157,6 +238,57 @@ def load_run(path: str | Path) -> ReplayEngine:
         for c in payload.get("collisions", ())
     ]
     engine._collision_pairs = {c.pair for c in engine.collisions}
+    engine.perceptions = [
+        PerceptionRecord(
+            perception_id=p["perception_id"],
+            tick_ms=int(p["tick_ms"]),
+            vehicle_id=p["vehicle_id"],
+            stimulus=p["stimulus"],
+            source_id=p["source_id"],
+            observed=dict(p["observed"]),
+            response_id=p["response_id"],
+            order_index=int(p["order_index"]),
+            seq=int(p.get("seq", 0)),
+            supersedes_response_id=p.get("supersedes_response_id"),
+        )
+        for p in payload.get("perceptions", ())
+    ]
+    engine.responses = [
+        ResponseRecord(
+            response_id=r["response_id"],
+            vehicle_id=r["vehicle_id"],
+            stimulus=r["stimulus"],
+            source_id=r["source_id"],
+            trigger_tick_ms=int(r["trigger_tick_ms"]),
+            due_tick_ms=int(r["due_tick_ms"]),
+            action=dict(r["action"]),
+            status=r.get("status", "executed"),
+            order_index=int(r.get("order_index", 0)),
+            perception_id=r.get("perception_id"),
+            superseded_by=r.get("superseded_by"),
+            reason=r.get("reason"),
+        )
+        for r in payload.get("responses", ())
+    ]
+    engine.state.pending_responses = [
+        ResponseRecord(
+            response_id=r["response_id"],
+            vehicle_id=r["vehicle_id"],
+            stimulus=r["stimulus"],
+            source_id=r["source_id"],
+            trigger_tick_ms=int(r["trigger_tick_ms"]),
+            due_tick_ms=int(r["due_tick_ms"]),
+            action=dict(r["action"]),
+            status=r.get("status", "scheduled"),
+            order_index=int(r.get("order_index", 0)),
+            perception_id=r.get("perception_id"),
+            superseded_by=r.get("superseded_by"),
+            reason=r.get("reason"),
+        )
+        for r in st.get("pending_responses", ())
+    ]
+    engine._handled_perceptions = {p.perception_id for p in engine.perceptions}
+    engine._handled_responses = {r.response_id for r in engine.responses}
     return engine
 
 

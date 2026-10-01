@@ -1,6 +1,11 @@
 """确定性自动驾驶场景回放系统。"""
 from .scenario import Scenario, Vehicle, Pedestrian, Signal, ScriptedEvent
-from .engine import ReplayEngine, EngineState
+from .engine import (
+    EngineState,
+    PerceptionRecord,
+    ReplayEngine,
+    ResponseRecord,
+)
 from .storage import save_run, load_run
 from .branching import BranchChanges, branch_from
 from .comparison import (
@@ -9,6 +14,7 @@ from .comparison import (
     Divergence,
     compare_at,
     first_divergence,
+    first_response_comparison,
 )
 
 __all__ = [
@@ -19,6 +25,8 @@ __all__ = [
     "ScriptedEvent",
     "ReplayEngine",
     "EngineState",
+    "PerceptionRecord",
+    "ResponseRecord",
     "save_run",
     "load_run",
     "BranchChanges",
@@ -28,4 +36,5 @@ __all__ = [
     "compare_at",
     "Divergence",
     "first_divergence",
+    "first_response_comparison",
 ]
