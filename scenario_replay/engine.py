@@ -436,7 +436,17 @@ class ReplayEngine:
             already_handled = event.event_id in fired
             # 副作用始终按时间轴应用：这样从过去继续推进时，
             # 已处理事件对状态的影响仍被确定性地重建。
-            self._apply_action(state, event)
+            if event.action.get("type") == "inject_perception":
+                self._apply_injected_perception(
+                    state,
+                    event,
+                    perceptions,
+                    responses,
+                    handled_perceptions,
+                    handled_responses,
+                )
+            else:
+                self._apply_action(state, event)
             if already_handled:
                 continue  # 跳转后继续运行，不重复触发/登记
             fired.add(event.event_id)
@@ -575,6 +585,78 @@ class ReplayEngine:
             )
         else:
             raise ValueError(f"unknown response action type: {kind!r}")
+
+    def _apply_injected_perception(
+        self,
+        state: EngineState,
+        event: ScriptedEvent,
+        perceptions: List[PerceptionRecord],
+        responses: List[ResponseRecord],
+        handled_perceptions: set[str],
+        handled_responses: set[str],
+    ) -> None:
+        """派生方案注入的感知事实：在事件 tick 采用该感知时刻与延迟。
+
+        与自动感知走同一套 ResponseRecord 调度，因此跳转重放、保存恢复
+        与再次分支的行为完全一致；记录通过 handled 集合去重。
+        """
+        action = event.action
+        vehicle_id = action["vehicle_id"]
+        stimulus = action["stimulus"]
+        source_id = action.get("source_id", "")
+        delay = action.get("delay_ms")
+        perception_id = f"injected-perception:{event.event_id}"
+        response_id = f"injected-response:{event.event_id}"
+        observed = dict(action.get("observed", {}))
+        observed["injected"] = True
+        observed["delay_ms"] = delay
+        superseded = None
+        if delay is None or not state.active_actors.get(vehicle_id, True):
+            reason = action.get("reason")
+            if not state.active_actors.get(vehicle_id, True):
+                reason = f"vehicle exited; {reason or ''}".strip("; ")
+            self._record_ignored_response(
+                responses=responses,
+                handled_responses=handled_responses,
+                response_id=response_id,
+                vehicle_id=vehicle_id,
+                stimulus=stimulus,
+                source_id=source_id,
+                trigger_tick=state.tick_ms,
+                perception_id=perception_id,
+                reason=reason,
+            )
+        else:
+            superseded = self._schedule_response(
+                state=state,
+                responses=responses,
+                handled_responses=handled_responses,
+                vehicle_id=vehicle_id,
+                stimulus=stimulus,
+                source_id=source_id,
+                trigger_tick=state.tick_ms,
+                delay_ms=int(round(delay)),
+                response_id=response_id,
+                perception_id=perception_id,
+                action_override=action.get("response_action"),
+                reason_override=action.get("reason"),
+            )
+        if perception_id not in handled_perceptions:
+            handled_perceptions.add(perception_id)
+            perceptions.append(
+                PerceptionRecord(
+                    perception_id=perception_id,
+                    tick_ms=state.tick_ms,
+                    vehicle_id=vehicle_id,
+                    stimulus=stimulus,
+                    source_id=source_id,
+                    observed=observed,
+                    response_id=response_id,
+                    order_index=len(perceptions),
+                    seq=0,
+                    supersedes_response_id=superseded,
+                )
+            )
 
     def _perceive(
         self,
@@ -729,16 +811,22 @@ class ReplayEngine:
         delay_ms: int,
         response_id: str,
         perception_id: str,
+        action_override: Optional[dict] = None,
+        reason_override: Optional[str] = None,
     ) -> Optional[str]:
         if delay_ms % self.scenario.tick_ms != 0:
             raise ValueError("reaction delay must align with scenario tick_ms")
         if delay_ms < 0:
             raise ValueError("reaction delay must be non-negative")
-        action = {
-            "type": "stop_actor",
-            "actor_id": vehicle_id,
-        }
-        reason = (
+        if action_override is None:
+            action = {
+                "type": "stop_actor",
+                "actor_id": vehicle_id,
+            }
+        else:
+            action = dict(action_override)
+            action.setdefault("actor_id", vehicle_id)
+        reason = reason_override or (
             f"{vehicle_id} 看到 {source_id} 的 {stimulus} 后延迟 {delay_ms}ms 制动"
         )
         superseded_id = None
@@ -779,6 +867,7 @@ class ReplayEngine:
         source_id: str,
         trigger_tick: int,
         perception_id: str,
+        reason: Optional[str] = None,
     ) -> None:
         if response_id in handled_responses:
             return
@@ -795,7 +884,8 @@ class ReplayEngine:
                 status="ignored",
                 order_index=len(responses),
                 perception_id=perception_id,
-                reason=f"{vehicle_id} 看到 {source_id} 的 {stimulus}，该方案未配置响应延迟",
+                reason=reason
+                or f"{vehicle_id} 看到 {source_id} 的 {stimulus}，该方案未配置响应延迟",
             )
         )
 

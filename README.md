@@ -30,6 +30,21 @@
   PerceptionRecord 记录感知时刻与事实，ResponseRecord 记录原定触发/到期
   时刻、动作及 `scheduled/executed/superseded/cancelled/ignored` 状态；
   待执行动作保存并恢复后仍在原到期时刻执行，回跳与再次分支不会重复执行。
+- 不确定感知范围：PerceptionWindow 把"驾驶员在 [earliest, latest] 内
+  看到刺激"作为分支输入；WindowConstraint 表达同一车辆多个感知范围
+  之间的约束（after：后一个观察不早于前一个；same：两条记录来自
+  同一次观察）。enumerate_assignments 枚举全部合法组合，derive_schemes
+  为每个组合派生自包含方案（感知事实经 inject_perception 事件注入，
+  确定可重放），derive_scheme 可在已有冲突附近追加单个具体方案。
+  每个方案保留实际采用的感知时刻与反应延迟（adopted_perception_facts）。
+- 离散对照结论：evaluate_schemes 把已发现冲突的方案与范围内未见冲突的
+  方案分开列出，未考察的组合单独计数——单一方案无碰撞不代表整个范围
+  安全；UncertaintyReport.conclusion 明确标注结果只是 tick 级离散采样
+  与有限时域内的对照，不构成连续时间安全证明。修改不确定范围只派生
+  新方案，不回写旧方案的感知事实；已退出车辆的待响应事件不进入派生方案。
+- 差异归因：attribute_difference 说明两个方案的结果差异来自感知选择、
+  反应延迟还是后续信号安排，并给出首次使结果分开的交通事件
+  （first_divergence 时刻的感知、响应与脚本事件记录）。
 - 反应方案比较：first_response_comparison 比较首感和首响应，
   minimum_gap_between 统计最小间距，conflict_event_chain 汇总冲突前的
   感知、响应和脚本事件链。
@@ -50,4 +65,7 @@ signal_phases()，并共享同一时钟即可。
 覆盖：同 tick 事件固定顺序、逐步与直跳一致性、暂停/中断、跳回过去
 不重复触发、交错车辆行人位置核对、保存/加载后继续运行、同刻变灯与刹车、
 行人横穿碰撞、分支中断恢复、分支对比与分支存档独立重建、分支不带入
-父场景后续事件、同时刻多分支对照与首处差异定位、分支内再分支的事件归属。
+父场景后续事件、同时刻多分支对照与首处差异定位、分支内再分支的事件归属、
+不确定感知范围的约束枚举与派生、边界时刻/同刻刺激注入、冲突附近追加方案、
+范围修改不回写旧方案、退出车辆待响应事件隔离、感知-延迟-信号安排的差异归因、
+感知已发生动作未响应时的保存继续、嵌套派生的事件归属。

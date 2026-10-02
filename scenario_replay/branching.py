@@ -156,24 +156,8 @@ def branch_from(
     branch._fired.update(
         event.event_id for event in source.events if event.tick_ms <= branch_point
     )
-    existing_fired = set(engine._fired)
-    setup_by_id = {record.event_id: record for record in setup_records}
-    for event in sorted(branch_events, key=lambda e: (e.tick_ms, e.seq, e.event_id)):
-        if event.tick_ms != branch_point or event.event_id in existing_fired:
-            continue
-        branch._apply_action(branch.state, event)
-        if event.event_id not in branch._fired:
-            record = setup_by_id.get(event.event_id)
-            if record is None:
-                record = EventRecord(
-                    tick_ms=branch_point,
-                    event_id=event.event_id,
-                    order_index=len(branch.journal),
-                    action=dict(event.action),
-                    reason=event.action.get("reason"),
-                )
-            branch.journal.append(record)
-            branch._fired.add(event.event_id)
+    # 分支点及之前的碰撞/感知/响应记录先就位：分支点上的注入事件
+    # （如 inject_perception）需要把记录追加到共享前缀之后。
     branch.collisions = [
         _clone_collision(record)
         for record in engine.collisions
@@ -196,6 +180,34 @@ def branch_from(
         record.response_id for record in branch.responses
     }
     branch._collision_pairs = {record.pair for record in branch.collisions}
+    existing_fired = set(engine._fired)
+    setup_by_id = {record.event_id: record for record in setup_records}
+    for event in sorted(branch_events, key=lambda e: (e.tick_ms, e.seq, e.event_id)):
+        if event.tick_ms != branch_point or event.event_id in existing_fired:
+            continue
+        if event.action.get("type") == "inject_perception":
+            branch._apply_injected_perception(
+                branch.state,
+                event,
+                branch.perceptions,
+                branch.responses,
+                branch._handled_perceptions,
+                branch._handled_responses,
+            )
+        else:
+            branch._apply_action(branch.state, event)
+        if event.event_id not in branch._fired:
+            record = setup_by_id.get(event.event_id)
+            if record is None:
+                record = EventRecord(
+                    tick_ms=branch_point,
+                    event_id=event.event_id,
+                    order_index=len(branch.journal),
+                    action=dict(event.action),
+                    reason=event.action.get("reason"),
+                )
+            branch.journal.append(record)
+            branch._fired.add(event.event_id)
     branch.paused = False
     return branch
 
@@ -264,6 +276,13 @@ def _clone_branch_state(state: EngineState, changes: BranchChanges) -> EngineSta
         cloned.reaction_params.setdefault(actor_id, {}).update(params)
     for actor_id, delays in changes.vehicle_reaction_delays.items():
         cloned.reaction_delays.setdefault(actor_id, {}).update(delays)
+    # 已退出车辆的待响应动作不属于任何派生方案：不得带入分支
+    cloned.pending_responses = [
+        response
+        for response in cloned.pending_responses
+        if response.status != "scheduled"
+        or cloned.active_actors.get(response.vehicle_id, True)
+    ]
     return cloned
 
 

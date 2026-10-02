@@ -16,6 +16,23 @@ from .comparison import (
     first_divergence,
     first_response_comparison,
 )
+from .uncertainty import (
+    AdoptedPerception,
+    DerivedScheme,
+    DifferenceAttribution,
+    PerceptionWindow,
+    SchemeEvaluation,
+    UncertaintyReport,
+    WindowConstraint,
+    adopted_perception_facts,
+    attribute_difference,
+    check_assignment,
+    derive_scheme,
+    derive_schemes,
+    enumerate_assignments,
+    evaluate_schemes,
+    window_ticks,
+)
 
 __all__ = [
     "Scenario",
@@ -37,4 +54,19 @@ __all__ = [
     "Divergence",
     "first_divergence",
     "first_response_comparison",
+    "PerceptionWindow",
+    "WindowConstraint",
+    "AdoptedPerception",
+    "DerivedScheme",
+    "SchemeEvaluation",
+    "UncertaintyReport",
+    "DifferenceAttribution",
+    "window_ticks",
+    "enumerate_assignments",
+    "check_assignment",
+    "derive_scheme",
+    "derive_schemes",
+    "adopted_perception_facts",
+    "evaluate_schemes",
+    "attribute_difference",
 ]
