@@ -1,5 +1,12 @@
 """确定性自动驾驶场景回放系统。"""
-from .scenario import Scenario, Vehicle, Pedestrian, Signal, ScriptedEvent
+from .scenario import (
+    PlannedPerception,
+    Scenario,
+    Vehicle,
+    Pedestrian,
+    Signal,
+    ScriptedEvent,
+)
 from .engine import (
     EngineState,
     PerceptionRecord,
@@ -16,6 +23,20 @@ from .comparison import (
     first_divergence,
     first_response_comparison,
 )
+from .uncertainty import (
+    DifferenceExplanation,
+    PerceptionConstraint,
+    PerceptionScheme,
+    SchemeResult,
+    UncertainPerception,
+    UncertaintyReport,
+    UnexploredInterval,
+    append_scheme,
+    enumerate_schemes,
+    evaluate_uncertainty,
+    explain_difference,
+    make_scheme,
+)
 
 __all__ = [
     "Scenario",
@@ -23,6 +44,7 @@ __all__ = [
     "Pedestrian",
     "Signal",
     "ScriptedEvent",
+    "PlannedPerception",
     "ReplayEngine",
     "EngineState",
     "PerceptionRecord",
@@ -37,4 +59,16 @@ __all__ = [
     "Divergence",
     "first_divergence",
     "first_response_comparison",
+    "UncertainPerception",
+    "PerceptionConstraint",
+    "PerceptionScheme",
+    "SchemeResult",
+    "UncertaintyReport",
+    "UnexploredInterval",
+    "DifferenceExplanation",
+    "enumerate_schemes",
+    "make_scheme",
+    "evaluate_uncertainty",
+    "append_scheme",
+    "explain_difference",
 ]

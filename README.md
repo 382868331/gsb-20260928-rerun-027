@@ -33,6 +33,21 @@
 - 反应方案比较：first_response_comparison 比较首感和首响应，
   minimum_gap_between 统计最小间距，conflict_event_chain 汇总冲突前的
   感知、响应和脚本事件链。
+- 不确定感知对照：UncertainPerception 描述"驾驶员在
+  [earliest_ms, latest_ms] 内看到前车制动/信号切换"这类区间事实；
+  evaluate_uncertainty 枚举区间内候选感知时刻（可用 samples 只考察
+  边界），每个组合作为独立分支运行，SchemeResult 保留该方案实际采用的
+  感知时刻与反应延迟。PerceptionConstraint 约束同一车辆多条感知范围
+  的关系（order 先后 / same_observation 同次观察），不满足约束的组合
+  不会生成。报告把已发现冲突的方案（conflicts）、已考察无碰撞的方案
+  （clean）与未考察区间（unexplored）分开列出；coverage 恒为
+  "discrete"，is_continuous_safety_verified 恒为 False——离散对照
+  不能被展示成未经验证的连续安全结论。append_scheme 在已有冲突附近
+  追加具体方案且不回写旧方案的感知事实；explain_difference 说明差异
+  来自感知选择、反应延迟还是后续信号安排，并给出首次分开的 tick 与
+  该时刻的交通事件。计划感知（PlannedPerception）随场景存档，
+  覆盖同一 (vehicle, stimulus, source) 的自动感知；退出车辆的待响应
+  事件不进入派生方案，感知已发生而动作未响应时可 save_run 后继续。
 
 ## 用法示例
 
@@ -51,3 +66,6 @@ signal_phases()，并共享同一时钟即可。
 不重复触发、交错车辆行人位置核对、保存/加载后继续运行、同刻变灯与刹车、
 行人横穿碰撞、分支中断恢复、分支对比与分支存档独立重建、分支不带入
 父场景后续事件、同时刻多分支对照与首处差异定位、分支内再分支的事件归属。
+不确定感知：边界时刻采样与未考察区间列出、感知范围约束（先后/同次观察）、
+同刻刺激、嵌套分支保留父方案感知事实、追加方案不回写旧方案、退出车辆
+待响应不进入派生方案、感知与响应之间保存继续、差异归因与首次分开定位。

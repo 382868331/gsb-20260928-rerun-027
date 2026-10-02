@@ -453,10 +453,88 @@ class ReplayEngine:
                 new_records.append(record)
 
         self._perceive(state, perceptions, responses, handled_perceptions, handled_responses)
+        self._fire_planned_perceptions(
+            state, perceptions, responses, handled_perceptions, handled_responses
+        )
         self._record_cancelled_responses(state, responses, handled_responses)
         state.pending_responses = [
             response for response in state.pending_responses if response.status == "scheduled"
         ]
+
+    def _fire_planned_perceptions(
+        self,
+        state: EngineState,
+        perceptions: List[PerceptionRecord],
+        responses: List[ResponseRecord],
+        handled_perceptions: set[str],
+        handled_responses: set[str],
+    ) -> None:
+        for plan in self._planned_perceptions_at(state.tick_ms):
+            self._apply_planned_perception(
+                state, plan, perceptions, responses, handled_perceptions, handled_responses
+            )
+
+    def _planned_perceptions_at(self, tick_ms: int):
+        return tuple(
+            plan
+            for plan in sorted(
+                self.scenario.planned_perceptions, key=lambda plan: plan.plan_id
+            )
+            if plan.tick_ms == tick_ms
+        )
+
+    def _apply_planned_perception(
+        self,
+        state: EngineState,
+        plan,
+        perceptions: List[PerceptionRecord],
+        responses: List[ResponseRecord],
+        handled_perceptions: set[str],
+        handled_responses: set[str],
+    ) -> None:
+        perception_id = f"planned:{plan.plan_id}"
+        response_id = f"planned-response:{plan.plan_id}"
+        observed = {"planned": True, "plan_id": plan.plan_id, **dict(plan.observed)}
+        superseded = None
+        if plan.delay_ms is None:
+            self._record_ignored_response(
+                responses=responses,
+                handled_responses=handled_responses,
+                response_id=response_id,
+                vehicle_id=plan.vehicle_id,
+                stimulus=plan.stimulus,
+                source_id=plan.source_id,
+                trigger_tick=state.tick_ms,
+                perception_id=perception_id,
+            )
+        else:
+            superseded = self._schedule_response(
+                state=state,
+                responses=responses,
+                handled_responses=handled_responses,
+                vehicle_id=plan.vehicle_id,
+                stimulus=plan.stimulus,
+                source_id=plan.source_id,
+                trigger_tick=state.tick_ms,
+                delay_ms=int(plan.delay_ms),
+                response_id=response_id,
+                perception_id=perception_id,
+            )
+        if perception_id not in handled_perceptions:
+            handled_perceptions.add(perception_id)
+            perceptions.append(
+                PerceptionRecord(
+                    perception_id=perception_id,
+                    tick_ms=state.tick_ms,
+                    vehicle_id=plan.vehicle_id,
+                    stimulus=plan.stimulus,
+                    source_id=plan.source_id,
+                    observed=observed,
+                    response_id=response_id,
+                    order_index=len(perceptions),
+                    supersedes_response_id=superseded,
+                )
+            )
 
     @staticmethod
     def _record_cancelled_responses(
@@ -547,8 +625,11 @@ class ReplayEngine:
                 journal.append(record)
                 if new_records is not None:
                     new_records.append(record)
+        # 已取消的响应保留到 _record_cancelled_responses 记录后再清理
         state.pending_responses = [
-            response for response in state.pending_responses if response.status == "scheduled"
+            response
+            for response in state.pending_responses
+            if response.status in {"scheduled", "cancelled"}
         ]
 
     def _apply_response_action(self, state: EngineState, response: ResponseRecord) -> None:
@@ -584,6 +665,10 @@ class ReplayEngine:
         handled_perceptions: set[str],
         handled_responses: set[str],
     ) -> None:
+        planned_covered = {
+            (plan.vehicle_id, plan.stimulus, plan.source_id)
+            for plan in self.scenario.planned_perceptions
+        }
         stimuli: List[tuple] = []
         for signal in self.scenario.signals:
             phase = self.signal_phase(signal.signal_id, state)
@@ -629,6 +714,8 @@ class ReplayEngine:
                 stimulus_key = "lead_brake"
             if vehicle_id is None:
                 continue
+            if (vehicle_id, stimulus_key, source_id) in planned_covered:
+                continue  # 该刺激由方案注入的计划感知接管，避免重复记录
             delay = self._reaction_delay(state, vehicle_id, stimulus_key)
             perception_id = (
                 f"perception:{state.tick_ms}:{vehicle_id}:{kind}:{source_id}:{sequence}"

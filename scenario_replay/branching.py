@@ -12,6 +12,7 @@ from typing import Mapping, Optional, Tuple
 from .engine import CollisionRecord, EngineState, EventRecord, ReplayEngine
 from .scenario import (
     Pedestrian,
+    PlannedPerception,
     Scenario,
     ScriptedEvent,
     Signal,
@@ -27,6 +28,7 @@ class BranchChanges:
     signal_plans: Mapping[str, Tuple[Tuple[int, str], ...]] = field(default_factory=dict)
     vehicle_reaction_params: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
     vehicle_reaction_delays: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+    planned_perceptions: Tuple[PlannedPerception, ...] = ()
     extra_events: Tuple[ScriptedEvent, ...] = ()
     drop_event_ids: Tuple[str, ...] = ()
 
@@ -113,6 +115,18 @@ def branch_from(
     for actor_id in changes.vehicle_reaction_delays:
         if actor_id not in known_vehicles:
             raise KeyError(f"unknown vehicle: {actor_id}")
+    plan_ids = [plan.plan_id for plan in changes.planned_perceptions]
+    if len(plan_ids) != len(set(plan_ids)):
+        raise ValueError("planned perception plan_id must be unique")
+    for plan in changes.planned_perceptions:
+        if plan.vehicle_id not in known_vehicles:
+            raise KeyError(f"unknown vehicle: {plan.vehicle_id}")
+        if plan.tick_ms < branch_point:
+            raise ValueError("planned perception cannot occur before the branch point")
+        if plan.tick_ms % source.tick_ms != 0:
+            raise ValueError("planned perception tick must align with scenario tick_ms")
+        if plan.delay_ms is not None and plan.delay_ms % source.tick_ms != 0:
+            raise ValueError("planned perception delay must align with scenario tick_ms")
 
     reaction_params = {
         actor_id: dict(params)
@@ -141,6 +155,7 @@ def branch_from(
         branch_point_ms=branch_point,
         reaction_params=reaction_params,
         reaction_delays=reaction_delays,
+        planned_perceptions=(*source.planned_perceptions, *changes.planned_perceptions),
     )
 
     branch = ReplayEngine(scenario)
@@ -195,6 +210,17 @@ def branch_from(
     branch._handled_responses = {
         record.response_id for record in branch.responses
     }
+    # 分支点上的计划感知立即生效（引擎已位于该 tick，不会再步进经过它）。
+    for plan in sorted(changes.planned_perceptions, key=lambda item: item.plan_id):
+        if plan.tick_ms == branch_point:
+            branch._apply_planned_perception(
+                branch.state,
+                plan,
+                branch.perceptions,
+                branch.responses,
+                branch._handled_perceptions,
+                branch._handled_responses,
+            )
     branch._collision_pairs = {record.pair for record in branch.collisions}
     branch.paused = False
     return branch
@@ -260,6 +286,12 @@ def _replace_signal(
 
 def _clone_branch_state(state: EngineState, changes: BranchChanges) -> EngineState:
     cloned = state.clone()
+    # 已退出车辆的待响应事件不进入派生方案。
+    cloned.pending_responses = [
+        response
+        for response in cloned.pending_responses
+        if cloned.active_actors.get(response.vehicle_id, True)
+    ]
     for actor_id, params in changes.vehicle_reaction_params.items():
         cloned.reaction_params.setdefault(actor_id, {}).update(params)
     for actor_id, delays in changes.vehicle_reaction_delays.items():

@@ -14,6 +14,7 @@ from .engine import (
     ResponseRecord,
 )
 from .scenario import Pedestrian, Scenario, ScriptedEvent, Signal, Vehicle
+from .scenario import PlannedPerception
 
 if TYPE_CHECKING:
     pass
@@ -51,6 +52,18 @@ def scenario_to_dict(scenario: Scenario) -> dict:
             actor_id: dict(delays)
             for actor_id, delays in scenario.reaction_delays.items()
         },
+        "planned_perceptions": [
+            {
+                "plan_id": p.plan_id,
+                "vehicle_id": p.vehicle_id,
+                "stimulus": p.stimulus,
+                "source_id": p.source_id,
+                "tick_ms": p.tick_ms,
+                "delay_ms": p.delay_ms,
+                "observed": dict(p.observed),
+            }
+            for p in scenario.planned_perceptions
+        ],
     }
 
 
@@ -85,6 +98,18 @@ def scenario_from_dict(data: dict) -> Scenario:
             actor_id: {k: float(v) for k, v in delays.items()}
             for actor_id, delays in data.get("reaction_delays", {}).items()
         },
+        planned_perceptions=tuple(
+            PlannedPerception(
+                plan_id=p["plan_id"],
+                vehicle_id=p["vehicle_id"],
+                stimulus=p["stimulus"],
+                source_id=p["source_id"],
+                tick_ms=int(p["tick_ms"]),
+                delay_ms=None if p.get("delay_ms") is None else int(p["delay_ms"]),
+                observed=dict(p.get("observed", {})),
+            )
+            for p in data.get("planned_perceptions", ())
+        ),
     )
 
 

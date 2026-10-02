@@ -76,6 +76,24 @@ class ScriptedEvent:
 
 
 @dataclass(frozen=True)
+class PlannedPerception:
+    """在指定 tick 注入的一条感知事实（不确定感知方案的具体取值）。
+
+    与引擎自动感知不同：它表示"该方案假定驾驶员在 tick_ms 看到了
+    stimulus"，并在 delay_ms 后调度响应；delay_ms 为 None 时只记录
+    感知事实不调度动作。plan_id 在场景内唯一，保证重放确定性。
+    """
+
+    plan_id: str
+    vehicle_id: str
+    stimulus: str
+    source_id: str
+    tick_ms: int
+    delay_ms: "int | None"
+    observed: Mapping[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class Scenario:
     name: str
     version: str
@@ -95,6 +113,8 @@ class Scenario:
     # 车辆针对各类感知刺激的响应延迟（毫秒）。感知事实按发生时刻记录，
     # 实际动作在 due_ms = 感知时刻 + delay 时才执行。
     reaction_delays: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+    # 方案注入的计划感知；覆盖同一 (vehicle, stimulus, source) 的自动感知。
+    planned_perceptions: Tuple[PlannedPerception, ...] = ()
 
     def ordered_actors(self) -> List[Actor]:
         actors: List[Actor] = []
