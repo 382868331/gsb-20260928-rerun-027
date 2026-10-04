@@ -139,6 +139,9 @@ class ReplayEngine:
         self._handled_responses: set[str] = set()
         self._collision_pairs: set[Tuple[str, str]] = set()
         self.paused = False
+        # 已保存但尚未由用户确认重派生的输入修订。
+        # 这里只保存不透明数据；重派生前不得改变场景事件或反应参数。
+        self.pending_revision: Optional[dict] = None
 
     # ---- 基础查询 ----
 

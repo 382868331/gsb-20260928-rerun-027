@@ -178,6 +178,7 @@ def save_run(engine: ReplayEngine, path: str | Path) -> Path:
             }
             for r in engine.responses
         ],
+        "pending_revision": engine.pending_revision,
     }
     path = Path(path)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -289,6 +290,8 @@ def load_run(path: str | Path) -> ReplayEngine:
     ]
     engine._handled_perceptions = {p.perception_id for p in engine.perceptions}
     engine._handled_responses = {r.response_id for r in engine.responses}
+    pending_revision = payload.get("pending_revision")
+    engine.pending_revision = dict(pending_revision) if pending_revision else None
     return engine
 
 

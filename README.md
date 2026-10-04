@@ -42,6 +42,13 @@
   安全；UncertaintyReport.conclusion 明确标注结果只是 tick 级离散采样
   与有限时域内的对照，不构成连续时间安全证明。修改不确定范围只派生
   新方案，不回写旧方案的感知事实；已退出车辆的待响应事件不进入派生方案。
+  若在感知已发生、响应未到期时修订范围/刺激先后约束/反应延迟，
+  stage_perception_revision 只暂存修订并随 save_run 持久化；保存重开后
+  必须由用户显式调用 rederive_pending_revision 才采用新约束并生成新方案。
+  旧方案保留原采用事实和原待响应事件，新方案不会重复或借用这些事实。
+  ConstraintViolation 表示离散时刻组合不满足新刺激约束且未派生，
+  SchemeEvaluation.collisions 只表示实际重放出的交通碰撞；两者在报告中
+  分开计数。attribute_difference 同时给物理轨迹首处分歧与采用事实首处分歧。
 - 差异归因：attribute_difference 说明两个方案的结果差异来自感知选择、
   反应延迟还是后续信号安排，并给出首次使结果分开的交通事件
   （first_divergence 时刻的感知、响应与脚本事件记录）。

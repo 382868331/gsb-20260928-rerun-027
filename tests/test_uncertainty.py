@@ -11,13 +11,17 @@ from scenario_replay import (
     WindowConstraint,
     adopted_perception_facts,
     attribute_difference,
+    constraint_violations,
     check_assignment,
     derive_scheme,
     derive_schemes,
     enumerate_assignments,
     evaluate_schemes,
     load_run,
+    load_pending_revision,
+    rederive_pending_revision,
     save_run,
+    stage_perception_revision,
 )
 
 
@@ -365,3 +369,136 @@ def test_nested_derivation_from_scheme_keeps_event_ownership():
         assert len(nested_facts) == 1
         assert nested_facts[0].tick_ms == scheme.assignment["w-nested"]
 
+
+def test_constraint_violations_are_separate_from_actual_collisions():
+    stop_action = {"type": "set_speed", "speed": 0.0, "rate": 20.0}
+    first = PerceptionWindow(
+        "w1", "follower", "signal_red", "j1", 400, 500, 900,
+        response_action=stop_action,
+    )
+    second = PerceptionWindow(
+        "w2", "follower", "lead_brake", "leader", 400, 500, 900,
+        response_action=stop_action,
+    )
+    constraints = [WindowConstraint("same", "w1", "w2")]
+
+    violations = constraint_violations([first, second], constraints, 100)
+    assert {dict(v.assignment)["w1"] for v in violations} == {400, 500}
+    assert all(v.violated_constraints == tuple(constraints) for v in violations)
+    assert "非碰撞" in violations[0].reason
+
+    schemes = derive_schemes(
+        ReplayEngine(uncertain_lead_brake_scenario()),
+        "same",
+        [first, second],
+        constraints=constraints,
+        base_changes=brake_base_changes(),
+    )
+    assert len(schemes) == 2
+    report = evaluate_schemes(
+        schemes,
+        2500,
+        total_assignments=4,
+        constraint_violations_found=violations,
+    )
+    assert report.unexplored_count == 0
+    assert len(report.constraint_violations) == 2
+    assert all(evaluation.collisions for evaluation in report.conflicts)
+    conclusion = report.conclusion()
+    assert "不满足刺激约束（未派生、非碰撞）" in conclusion
+    assert str(len(report.conflicts)) in conclusion
+
+
+def test_revision_is_staged_until_reopened_and_user_rederives(tmp_path):
+    original = derive_scheme(
+        ReplayEngine(uncertain_lead_brake_scenario()),
+        "old",
+        [brake_window(400, 400, 500)],
+        {"w-brake": 400},
+        base_changes=brake_base_changes(),
+    ).engine
+    original.run_to(600)
+    old_pending = original.pending_response_records()[0]
+    assert old_pending.response_id == "injected-response:old:perceive:w-brake"
+
+    stage_perception_revision(
+        original,
+        [brake_window(600, 800, 500)],
+        base_changes=brake_base_changes(),
+        scheme_prefix="new",
+        horizon_ms=2500,
+    )
+    assert original.pending_response_records()[0].response_id == old_pending.response_id
+    assert not any(event.event_id.startswith("new:") for event in original.scenario.events)
+    path = save_run(original, tmp_path / "staged.json")
+
+    reopened = load_run(path)
+    staged = load_pending_revision(reopened)
+    assert staged is not None
+    assert staged.windows[0].earliest_ms == 600
+    assert reopened.pending_response_records()[0].response_id == old_pending.response_id
+
+    result = rederive_pending_revision(reopened, evaluate_until_ms=2500)
+    assert len(result.schemes) == 3
+    assert [scheme.assignment["w-brake"] for scheme in result.schemes] == [600, 700, 800]
+    assert reopened.pending_revision is None
+    assert not result.constraint_violations
+    assert result.report is not None
+    assert [evaluation.scheme_id for evaluation in result.report.conflicts] == [
+        "new-1",
+        "new-2",
+    ]
+
+    old_engine = reopened
+    new_engine = result.schemes[0].engine
+    old_engine.run_to(900)
+    new_engine.seek(900)
+    assert old_engine.pending_response_records() == ()
+    assert [p.tick_ms for p in new_engine.perceptions if p.observed.get("injected")] == [600]
+    assert [
+        r.response_id for r in new_engine.responses if r.status == "executed"
+    ] == ["injected-response:new-0:perceive:w-brake"]
+    assert not any(
+        response.response_id == old_pending.response_id
+        for response in new_engine.responses
+    )
+
+    attr = attribute_difference(old_engine, new_engine, 2500)
+    assert "perception_choice" in attr.causes
+    assert attr.divergence is not None
+    assert attr.divergence.tick_ms == 800
+    assert attr.fact_divergence is not None
+    assert attr.fact_divergence.tick_ms == 400
+    assert attr.first_events_a and attr.first_events_b
+
+
+def test_staged_revision_reports_invalid_and_collision_separately_after_reload(tmp_path):
+    stop_action = {"type": "set_speed", "speed": 0.0, "rate": 20.0}
+    first = PerceptionWindow(
+        "w1", "follower", "signal_red", "j1", 400, 500, 900,
+        response_action=stop_action,
+    )
+    second = PerceptionWindow(
+        "w2", "follower", "lead_brake", "leader", 400, 500, 900,
+        response_action=stop_action,
+    )
+    constraints = [WindowConstraint("same", "w1", "w2")]
+    engine = ReplayEngine(uncertain_lead_brake_scenario())
+    stage_perception_revision(
+        engine,
+        [first, second],
+        constraints,
+        base_changes=brake_base_changes(),
+        scheme_prefix="revised",
+    )
+    path = save_run(engine, tmp_path / "invalid.json")
+
+    result = rederive_pending_revision(load_run(path), evaluate_until_ms=2500)
+    assert len(result.schemes) == 2
+    assert len(result.constraint_violations) == 2
+    assert result.report is not None
+    assert result.report.total_assignments == 4
+    assert len(result.report.constraint_violations) == 2
+    assert {evaluation.scheme_id for evaluation in result.report.conflicts} == {"revised-1"}
+    assert all(evaluation.collisions for evaluation in result.report.conflicts)
+    assert "非碰撞" in result.report.conclusion()

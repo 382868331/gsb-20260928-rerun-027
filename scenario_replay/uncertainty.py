@@ -19,14 +19,16 @@
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from itertools import product
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .branching import BranchChanges, branch_from
 from .comparison import Divergence, first_divergence
 from .engine import CollisionRecord, ReplayEngine
-from .scenario import ScriptedEvent
+from .scenario import Scenario, ScriptedEvent
+from .storage import scenario_from_dict, scenario_to_dict
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,15 @@ class WindowConstraint:
     kind: str
     first_id: str
     second_id: str
+
+
+@dataclass(frozen=True)
+class ConstraintViolation:
+    """离散时刻组合不满足刺激先后/同刻约束；它不是交通碰撞。"""
+
+    assignment: Tuple[Tuple[str, int], ...]
+    violated_constraints: Tuple[WindowConstraint, ...]
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -93,6 +104,7 @@ class UncertaintyReport:
     horizon_ms: int
     tick_ms: int
     total_assignments: Optional[int]
+    constraint_violations: Tuple[ConstraintViolation, ...] = ()
 
     @property
     def conflicts(self) -> Tuple[SchemeEvaluation, ...]:
@@ -110,7 +122,10 @@ class UncertaintyReport:
     def unexplored_count(self) -> Optional[int]:
         if self.total_assignments is None:
             return None
-        return max(0, self.total_assignments - self.explored_count)
+        return max(
+            0,
+            self.total_assignments - self.explored_count - len(self.constraint_violations),
+        )
 
     @property
     def covers_full_range(self) -> bool:
@@ -128,6 +143,10 @@ class UncertaintyReport:
             f"{len(self.conflicts)} 个方案在 {self.horizon_ms}ms 内发现冲突",
             f"{len(self.clears)} 个方案在 {self.horizon_ms}ms 内未见冲突",
         ]
+        if self.constraint_violations:
+            parts.append(
+                f"{len(self.constraint_violations)} 个离散时刻组合不满足刺激约束（未派生、非碰撞）"
+            )
         unexplored = self.unexplored_count
         if unexplored is None:
             parts.append("组合总数未知，结果仅为抽样，不能据此判定范围安全")
@@ -152,6 +171,30 @@ class DifferenceAttribution:
     divergence: Optional[Divergence]
     first_events_a: Tuple[object, ...]
     first_events_b: Tuple[object, ...]
+    fact_divergence: Optional[Divergence] = None
+
+
+@dataclass(frozen=True)
+class PerceptionRevision:
+    """待用户确认的感知范围、刺激约束和反应延迟修订。"""
+
+    windows: Tuple[PerceptionWindow, ...]
+    constraints: Tuple[WindowConstraint, ...] = ()
+    base_scenario: Optional[Mapping[str, Any]] = None
+    base_changes: Optional[Mapping[str, Any]] = None
+    at_ms: Optional[int] = None
+    scheme_prefix: str = "revised"
+    horizon_ms: Optional[int] = None
+    created_at_ms: Optional[int] = None
+    reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RevisionResult:
+    revision: PerceptionRevision
+    schemes: Tuple[DerivedScheme, ...]
+    constraint_violations: Tuple[ConstraintViolation, ...]
+    report: Optional[UncertaintyReport]
 
 
 def window_ticks(window: PerceptionWindow, tick_ms: int) -> Tuple[int, ...]:
@@ -178,15 +221,30 @@ def enumerate_assignments(
     """枚举所有满足约束的感知时刻组合（按窗口顺序字典序）。"""
     windows = tuple(windows)
     _validate_windows(windows)
-    choices = [window_ticks(window, tick_ms) for window in windows]
-    result: List[Dict[str, int]] = []
-    for combo in product(*choices):
-        assignment = {
-            window.window_id: chosen for window, chosen in zip(windows, combo)
-        }
-        if _satisfies(assignment, constraints):
-            result.append(assignment)
-    return tuple(result)
+    return tuple(
+        assignment
+        for assignment, violation in _all_assignments_and_violations(
+            windows, constraints, tick_ms
+        )
+        if violation is None
+    )
+
+
+def constraint_violations(
+    windows: Sequence[PerceptionWindow],
+    constraints: Sequence[WindowConstraint],
+    tick_ms: int = 100,
+) -> Tuple[ConstraintViolation, ...]:
+    """返回范围内所有不满足刺激约束的离散时刻组合。"""
+    windows = tuple(windows)
+    _validate_windows(windows)
+    return tuple(
+        violation
+        for _, violation in _all_assignments_and_violations(
+            windows, constraints, tick_ms
+        )
+        if violation is not None
+    )
 
 
 def check_assignment(
@@ -319,10 +377,285 @@ def adopted_perception_facts(engine: ReplayEngine) -> Tuple[AdoptedPerception, .
     return tuple(facts)
 
 
+def stage_perception_revision(
+    engine: ReplayEngine,
+    windows: Sequence[PerceptionWindow],
+    constraints: Sequence[WindowConstraint] = (),
+    *,
+    at_ms: Optional[int] = None,
+    base_changes: Optional[BranchChanges] = None,
+    scheme_prefix: str = "revised",
+    horizon_ms: Optional[int] = None,
+    reason: Optional[str] = None,
+) -> PerceptionRevision:
+    """暂存修订；保存/重开后仍需用户显式调用重派生。"""
+    windows = tuple(windows)
+    constraints = tuple(constraints)
+    tick_ms = engine.scenario.tick_ms
+    for window in windows:
+        window_ticks(window, tick_ms)
+    for constraint in constraints:
+        ids = {window.window_id for window in windows}
+        if constraint.first_id not in ids or constraint.second_id not in ids:
+            raise ValueError(f"constraint references unknown window: {constraint}")
+        if constraint.kind not in {"after", "same"}:
+            raise ValueError(f"unknown constraint kind: {constraint.kind!r}")
+
+    revision = PerceptionRevision(
+        windows=windows,
+        constraints=constraints,
+        base_scenario=scenario_to_dict(_revision_base_scenario(engine)),
+        base_changes=branch_changes_to_dict(base_changes) if base_changes else None,
+        at_ms=at_ms,
+        scheme_prefix=scheme_prefix,
+        horizon_ms=horizon_ms,
+        created_at_ms=engine.now_ms,
+        reason=reason,
+    )
+    engine.pending_revision = revision_to_dict(revision)
+    return revision
+
+
+def load_pending_revision(engine: ReplayEngine) -> Optional[PerceptionRevision]:
+    if not engine.pending_revision:
+        return None
+    return revision_from_dict(engine.pending_revision)
+
+
+def rederive_pending_revision(
+    engine: ReplayEngine,
+    *,
+    adopt: bool = True,
+    evaluate_until_ms: Optional[int] = None,
+) -> RevisionResult:
+    """用户确认后才采用暂存修订；原引擎和旧方案事实不被原地改写。"""
+    stored = load_pending_revision(engine)
+    if stored is None:
+        raise ValueError("no pending perception revision")
+    if stored.base_scenario is None:
+        raise ValueError("pending revision does not contain a replayable base scenario")
+
+    base = ReplayEngine(scenario_from_dict(dict(stored.base_scenario)))
+    base_changes = (
+        branch_changes_from_dict(dict(stored.base_changes))
+        if stored.base_changes is not None
+        else None
+    )
+    tick_ms = base.scenario.tick_ms
+    assignments = enumerate_assignments(stored.windows, stored.constraints, tick_ms)
+    schemes = tuple(
+        derive_scheme(
+            base,
+            f"{stored.scheme_prefix}-{index}",
+            stored.windows,
+            assignment,
+            constraints=stored.constraints,
+            at_ms=stored.at_ms,
+            base_changes=base_changes,
+        )
+        for index, assignment in enumerate(assignments)
+    )
+    violations = constraint_violations(
+        stored.windows, stored.constraints, tick_ms
+    )
+    total = len(assignments) + len(violations)
+    horizon = evaluate_until_ms if evaluate_until_ms is not None else stored.horizon_ms
+    report = (
+        evaluate_schemes(
+            schemes,
+            horizon,
+            total_assignments=total,
+            constraint_violations_found=violations,
+        )
+        if horizon is not None
+        else None
+    )
+    if adopt:
+        engine.pending_revision = None
+    return RevisionResult(
+        revision=stored,
+        schemes=schemes,
+        constraint_violations=violations,
+        report=report,
+    )
+
+
+def _revision_base_scenario(engine: ReplayEngine) -> Scenario:
+    """移除当前待修订方案自身注入的未来/待响应事实，防止新方案借用。"""
+    current_branch = engine.scenario.branch_id
+    if current_branch is None:
+        return engine.scenario
+    prefix = f"{current_branch}:perceive:"
+    kept_events = tuple(
+        event
+        for event in engine.scenario.events
+        if not (
+            event.action.get("type") == "inject_perception"
+            and event.event_id.startswith(prefix)
+        )
+    )
+    if len(kept_events) == len(engine.scenario.events):
+        return engine.scenario
+    return Scenario(
+        name=engine.scenario.name,
+        version=engine.scenario.version,
+        seed=engine.scenario.seed,
+        vehicles=engine.scenario.vehicles,
+        pedestrians=engine.scenario.pedestrians,
+        signals=engine.scenario.signals,
+        events=kept_events,
+        tick_ms=engine.scenario.tick_ms,
+        branch_id=engine.scenario.branch_id,
+        parent_id=engine.scenario.parent_id,
+        branch_point_ms=engine.scenario.branch_point_ms,
+        reaction_params=engine.scenario.reaction_params,
+        reaction_delays=engine.scenario.reaction_delays,
+    )
+
+
+def branch_changes_to_dict(changes: BranchChanges) -> Dict[str, Any]:
+    return {
+        "vehicle_routes": {k: [list(p) for p in v] for k, v in changes.vehicle_routes.items()},
+        "pedestrian_routes": {k: [list(p) for p in v] for k, v in changes.pedestrian_routes.items()},
+        "pedestrian_speeds": dict(changes.pedestrian_speeds),
+        "signal_plans": {
+            k: [[t, phase] for t, phase in v]
+            for k, v in changes.signal_plans.items()
+        },
+        "vehicle_reaction_params": {
+            k: dict(v) for k, v in changes.vehicle_reaction_params.items()
+        },
+        "vehicle_reaction_delays": {
+            k: dict(v) for k, v in changes.vehicle_reaction_delays.items()
+        },
+        "extra_events": [
+            {
+                "event_id": event.event_id,
+                "tick_ms": event.tick_ms,
+                "action": dict(event.action),
+                "seq": event.seq,
+            }
+            for event in changes.extra_events
+        ],
+        "drop_event_ids": list(changes.drop_event_ids),
+    }
+
+
+def branch_changes_from_dict(data: Mapping[str, Any]) -> BranchChanges:
+    return BranchChanges(
+        vehicle_routes={
+            k: tuple((float(p[0]), float(p[1])) for p in v)
+            for k, v in data.get("vehicle_routes", {}).items()
+        },
+        pedestrian_routes={
+            k: tuple((float(p[0]), float(p[1])) for p in v)
+            for k, v in data.get("pedestrian_routes", {}).items()
+        },
+        pedestrian_speeds={k: float(v) for k, v in data.get("pedestrian_speeds", {}).items()},
+        signal_plans={
+            k: tuple((int(t), phase) for t, phase in v)
+            for k, v in data.get("signal_plans", {}).items()
+        },
+        vehicle_reaction_params={
+            k: {stimulus: float(value) for stimulus, value in params.items()}
+            for k, params in data.get("vehicle_reaction_params", {}).items()
+        },
+        vehicle_reaction_delays={
+            k: {stimulus: float(value) for stimulus, value in params.items()}
+            for k, params in data.get("vehicle_reaction_delays", {}).items()
+        },
+        extra_events=tuple(
+            ScriptedEvent(
+                event_id=event["event_id"],
+                tick_ms=int(event["tick_ms"]),
+                action=dict(event["action"]),
+                seq=int(event.get("seq", 0)),
+            )
+            for event in data.get("extra_events", ())
+        ),
+        drop_event_ids=tuple(data.get("drop_event_ids", ())),
+    )
+
+
+def revision_to_dict(revision: PerceptionRevision) -> Dict[str, Any]:
+    return {
+        "windows": [
+            {
+                "window_id": window.window_id,
+                "vehicle_id": window.vehicle_id,
+                "stimulus": window.stimulus,
+                "source_id": window.source_id,
+                "earliest_ms": window.earliest_ms,
+                "latest_ms": window.latest_ms,
+                "delay_ms": window.delay_ms,
+                "observed": dict(window.observed),
+                "response_action": (
+                    dict(window.response_action)
+                    if window.response_action is not None
+                    else None
+                ),
+            }
+            for window in revision.windows
+        ],
+        "constraints": [
+            {
+                "kind": constraint.kind,
+                "first_id": constraint.first_id,
+                "second_id": constraint.second_id,
+            }
+            for constraint in revision.constraints
+        ],
+        "base_scenario": dict(revision.base_scenario) if revision.base_scenario else None,
+        "base_changes": dict(revision.base_changes) if revision.base_changes else None,
+        "at_ms": revision.at_ms,
+        "scheme_prefix": revision.scheme_prefix,
+        "horizon_ms": revision.horizon_ms,
+        "created_at_ms": revision.created_at_ms,
+        "reason": revision.reason,
+    }
+
+
+def revision_from_dict(data: Mapping[str, Any]) -> PerceptionRevision:
+    return PerceptionRevision(
+        windows=tuple(
+            PerceptionWindow(
+                window_id=window["window_id"],
+                vehicle_id=window["vehicle_id"],
+                stimulus=window["stimulus"],
+                source_id=window["source_id"],
+                earliest_ms=int(window["earliest_ms"]),
+                latest_ms=int(window["latest_ms"]),
+                delay_ms=int(window["delay_ms"]),
+                observed=dict(window.get("observed", {})),
+                response_action=dict(window["response_action"])
+                if window.get("response_action") is not None
+                else None,
+            )
+            for window in data["windows"]
+        ),
+        constraints=tuple(
+            WindowConstraint(
+                kind=constraint["kind"],
+                first_id=constraint["first_id"],
+                second_id=constraint["second_id"],
+            )
+            for constraint in data.get("constraints", ())
+        ),
+        base_scenario=dict(data["base_scenario"]) if data.get("base_scenario") else None,
+        base_changes=dict(data["base_changes"]) if data.get("base_changes") else None,
+        at_ms=int(data["at_ms"]) if data.get("at_ms") is not None else None,
+        scheme_prefix=data.get("scheme_prefix", "revised"),
+        horizon_ms=int(data["horizon_ms"]) if data.get("horizon_ms") is not None else None,
+        created_at_ms=int(data["created_at_ms"]) if data.get("created_at_ms") is not None else None,
+        reason=data.get("reason"),
+    )
+
+
 def evaluate_schemes(
     schemes: Sequence[DerivedScheme],
     until_ms: int,
     total_assignments: Optional[int] = None,
+    constraint_violations_found: Sequence[ConstraintViolation] = (),
 ) -> UncertaintyReport:
     """逐个重放方案并汇总；未见冲突与已发现冲突分开列出。"""
     evaluations: List[SchemeEvaluation] = []
@@ -351,6 +684,7 @@ def evaluate_schemes(
         horizon_ms=until_ms,
         tick_ms=tick_ms if tick_ms is not None else 0,
         total_assignments=total_assignments,
+        constraint_violations=tuple(constraint_violations_found),
     )
 
 
@@ -396,12 +730,94 @@ def attribute_difference(
     if divergence is not None:
         first_events_a = _records_at(engine_a, divergence.tick_ms)
         first_events_b = _records_at(engine_b, divergence.tick_ms)
+    fact_divergence = _first_fact_divergence(engine_a, engine_b, until_ms, causes)
+    if fact_divergence is not None and (not first_events_a or not first_events_b):
+        first_events_a = _records_at(engine_a, fact_divergence.tick_ms)
+        first_events_b = _records_at(engine_b, fact_divergence.tick_ms)
     return DifferenceAttribution(
         causes=tuple(causes),
         divergence=divergence,
         first_events_a=first_events_a,
         first_events_b=first_events_b,
+        fact_divergence=fact_divergence,
     )
+
+
+def _first_fact_divergence(
+    engine_a: ReplayEngine,
+    engine_b: ReplayEngine,
+    until_ms: int,
+    causes: Sequence[str],
+) -> Optional[Divergence]:
+    if not causes:
+        return None
+    candidates: List[int] = []
+    perceptions_a = _fact_tuples(engine_a.perceptions, "perception")
+    perceptions_b = _fact_tuples(engine_b.perceptions, "perception")
+    responses_a = _fact_tuples(engine_a.responses, "response")
+    responses_b = _fact_tuples(engine_b.responses, "response")
+    events_a = _fact_tuples(engine_a.journal, "event")
+    events_b = _fact_tuples(engine_b.journal, "event")
+    if perceptions_a != perceptions_b:
+        candidates.append(_first_different_time(perceptions_a, perceptions_b, until_ms))
+    if responses_a != responses_b:
+        candidates.append(_first_different_time(responses_a, responses_b, until_ms))
+    if events_a != events_b:
+        candidates.append(_first_different_time(events_a, events_b, until_ms))
+    return Divergence(tick_ms=min(candidates), aspects=("adopted_facts",)) if candidates else None
+
+
+def _fact_tuples(records: Sequence[object], kind: str) -> Tuple[Tuple[int, tuple], ...]:
+    normalized: List[Tuple[int, tuple]] = []
+    for index, record in enumerate(records):
+        if kind == "perception":
+            if not getattr(record, "observed", {}).get("injected"):
+                continue
+            when = record.tick_ms
+            identity = (
+                record.vehicle_id,
+                record.stimulus,
+                record.source_id,
+                _stable(_observed_without_scheme_fields(record.observed)),
+            )
+        elif kind == "response":
+            when = record.trigger_tick_ms
+            identity = (
+                record.vehicle_id,
+                record.stimulus,
+                record.source_id,
+                record.due_tick_ms,
+                _stable(record.action),
+            )
+        else:
+            when = record.tick_ms
+            if record.action.get("type") != "inject_perception":
+                continue
+            identity = (
+                record.action.get("vehicle_id"),
+                record.action.get("stimulus"),
+                record.action.get("source_id"),
+                record.action.get("delay_ms"),
+                _stable(_observed_without_scheme_fields(record.action.get("observed", {}))),
+            )
+        if when <= max(0, 10**12):
+            normalized.append((when, identity))
+    return tuple(normalized)
+
+
+def _first_different_time(
+    records_a: Sequence[Tuple[int, tuple]],
+    records_b: Sequence[Tuple[int, tuple]],
+    until_ms: int,
+) -> int:
+    set_a = set(records_a)
+    set_b = set(records_b)
+    times = [
+        when
+        for when, _ in (*(set_a - set_b), *(set_b - set_a))
+        if when <= until_ms
+    ]
+    return min(times) if times else until_ms
 
 
 def _validate_windows(windows: Tuple[PerceptionWindow, ...]) -> None:
@@ -410,9 +826,38 @@ def _validate_windows(windows: Tuple[PerceptionWindow, ...]) -> None:
         raise ValueError(f"duplicate window ids: {ids}")
 
 
-def _satisfies(
+def _all_assignments_and_violations(
+    windows: Tuple[PerceptionWindow, ...],
+    constraints: Sequence[WindowConstraint],
+    tick_ms: int,
+) -> Tuple[Tuple[Dict[str, int], Optional[ConstraintViolation]], ...]:
+    choices = [window_ticks(window, tick_ms) for window in windows]
+    result: List[Tuple[Dict[str, int], Optional[ConstraintViolation]]] = []
+    for combo in product(*choices):
+        assignment = {
+            window.window_id: chosen for window, chosen in zip(windows, combo)
+        }
+        violated = _violated_constraints(assignment, constraints)
+        if violated:
+            result.append(
+                (
+                    assignment,
+                    ConstraintViolation(
+                        assignment=tuple(sorted(assignment.items())),
+                        violated_constraints=tuple(violated),
+                        reason="感知组合不满足刺激先后/同刻约束，未派生为交通方案；这是约束不满足，非碰撞",
+                    ),
+                )
+            )
+        else:
+            result.append((assignment, None))
+    return tuple(result)
+
+
+def _violated_constraints(
     assignment: Mapping[str, int], constraints: Sequence[WindowConstraint]
-) -> bool:
+) -> List[WindowConstraint]:
+    violated: List[WindowConstraint] = []
     for constraint in constraints:
         first = assignment.get(constraint.first_id)
         second = assignment.get(constraint.second_id)
@@ -420,13 +865,19 @@ def _satisfies(
             raise ValueError(
                 f"constraint references unknown window: {constraint}"
             )
-        if constraint.kind == "after" and not second >= first:
-            return False
-        if constraint.kind == "same" and not second == first:
-            return False
         if constraint.kind not in {"after", "same"}:
             raise ValueError(f"unknown constraint kind: {constraint.kind!r}")
-    return True
+        if constraint.kind == "after" and second < first:
+            violated.append(constraint)
+        if constraint.kind == "same" and second != first:
+            violated.append(constraint)
+    return violated
+
+
+def _satisfies(
+    assignment: Mapping[str, int], constraints: Sequence[WindowConstraint]
+) -> bool:
+    return not _violated_constraints(assignment, constraints)
 
 
 def _merge_changes(
@@ -471,3 +922,14 @@ def _records_at(engine: ReplayEngine, tick_ms: int) -> Tuple[object, ...]:
     records.extend(record for record in engine.journal if record.tick_ms == tick_ms)
     return tuple(records)
 
+
+def _stable(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _observed_without_scheme_fields(observed: Mapping[str, object]) -> Dict[str, object]:
+    return {
+        key: value
+        for key, value in observed.items()
+        if key not in {"window_id", "injected", "delay_ms"}
+    }
