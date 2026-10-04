@@ -148,7 +148,9 @@ def branch_from(
     # 事件归属：分支点及之前的记录是共享事实，原样保留；
     # 父场景在分支点之后触发的事件不属于本分支，不得带入。
     branch.journal = [
-        record for record in engine.journal if record.tick_ms <= branch_point
+        record
+        for record in engine.journal
+        if record.tick_ms <= branch_point and record.event_id not in drop_ids
     ]
     # 分支点及之前的场景事件视为已处理：向后跳转再重放时
     # 只重建副作用，不得再次登记/累计。
@@ -166,12 +168,13 @@ def branch_from(
     branch.perceptions = [
         _clone_perception(record)
         for record in engine.perception_records()
-        if record.tick_ms <= branch_point
+        if record.tick_ms <= branch_point and record.perception_id not in drop_ids
     ]
     branch.responses = [
         record.clone()
         for record in engine.response_records()
         if record.trigger_tick_ms <= branch_point
+        and record.response_id not in drop_ids
     ]
     branch._handled_perceptions = {
         record.perception_id for record in branch.perceptions
@@ -280,8 +283,13 @@ def _clone_branch_state(state: EngineState, changes: BranchChanges) -> EngineSta
     cloned.pending_responses = [
         response
         for response in cloned.pending_responses
-        if response.status != "scheduled"
-        or cloned.active_actors.get(response.vehicle_id, True)
+        if (
+            (
+                response.status != "scheduled"
+                or cloned.active_actors.get(response.vehicle_id, True)
+            )
+            and response.response_id not in set(changes.drop_event_ids)
+        )
     ]
     return cloned
 

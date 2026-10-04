@@ -179,6 +179,8 @@ def save_run(engine: ReplayEngine, path: str | Path) -> Path:
             for r in engine.responses
         ],
     }
+    if engine.pending_revision is not None:
+        payload["pending_revision"] = _revision_to_dict(engine.pending_revision)
     path = Path(path)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
@@ -289,7 +291,81 @@ def load_run(path: str | Path) -> ReplayEngine:
     ]
     engine._handled_perceptions = {p.perception_id for p in engine.perceptions}
     engine._handled_responses = {r.response_id for r in engine.responses}
+    if "pending_revision" in payload:
+        engine.pending_revision = _revision_from_dict(payload["pending_revision"])
     return engine
+
+
+def _revision_to_dict(revision) -> dict:
+    return {
+        "revision_id": revision.revision_id,
+        "created_tick_ms": revision.created_tick_ms,
+        "base_scheme_id": revision.base_scheme_id,
+        "status": revision.status,
+        "windows": [
+            {
+                "window_id": w.window_id,
+                "vehicle_id": w.vehicle_id,
+                "stimulus": w.stimulus,
+                "source_id": w.source_id,
+                "earliest_ms": w.earliest_ms,
+                "latest_ms": w.latest_ms,
+                "delay_ms": w.delay_ms,
+                "observed": dict(w.observed),
+                "response_action": (
+                    dict(w.response_action)
+                    if w.response_action is not None
+                    else None
+                ),
+            }
+            for w in revision.windows
+        ],
+        "constraints": [
+            {
+                "kind": c.kind,
+                "first_id": c.first_id,
+                "second_id": c.second_id,
+            }
+            for c in revision.constraints
+        ],
+    }
+
+
+def _revision_from_dict(data: dict):
+    from .uncertainty import PerceptionWindow, RevisionRequest, WindowConstraint
+
+    return RevisionRequest(
+        revision_id=data["revision_id"],
+        created_tick_ms=int(data.get("created_tick_ms", 0)),
+        base_scheme_id=data.get("base_scheme_id"),
+        status=data.get("status", "pending"),
+        windows=tuple(
+            PerceptionWindow(
+                window_id=w["window_id"],
+                vehicle_id=w["vehicle_id"],
+                stimulus=w["stimulus"],
+                source_id=w["source_id"],
+                earliest_ms=int(w["earliest_ms"]),
+                latest_ms=int(w["latest_ms"]),
+                delay_ms=int(w["delay_ms"]),
+                observed=dict(w.get("observed", {})),
+                response_action=(
+                    dict(w["response_action"])
+                    if w.get("response_action") is not None
+                    else None
+                ),
+            )
+            for w in data["windows"]
+        ),
+        constraints=tuple(
+            WindowConstraint(
+                kind=c["kind"],
+                first_id=c["first_id"],
+                second_id=c["second_id"],
+            )
+            for c in data.get("constraints", ())
+        ),
+    )
 
 
 def _actor_to_dict(actor) -> dict:

@@ -139,6 +139,7 @@ class ReplayEngine:
         self._handled_responses: set[str] = set()
         self._collision_pairs: set[Tuple[str, str]] = set()
         self.paused = False
+        self.pending_revision: Optional[object] = None
 
     # ---- 基础查询 ----
 

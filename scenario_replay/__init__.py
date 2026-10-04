@@ -18,9 +18,12 @@ from .comparison import (
 )
 from .uncertainty import (
     AdoptedPerception,
+    ConstraintViolation,
     DerivedScheme,
     DifferenceAttribution,
     PerceptionWindow,
+    RevisionRequest,
+    RevisionResult,
     SchemeEvaluation,
     UncertaintyReport,
     WindowConstraint,
@@ -29,9 +32,14 @@ from .uncertainty import (
     check_assignment,
     derive_scheme,
     derive_schemes,
+    derive_revised_schemes,
     enumerate_assignments,
     evaluate_schemes,
+    evaluate_revision,
     window_ticks,
+    request_revision,
+    rederive_revision,
+    assignment_constraint_violations,
 )
 
 __all__ = [
@@ -56,6 +64,9 @@ __all__ = [
     "first_response_comparison",
     "PerceptionWindow",
     "WindowConstraint",
+    "ConstraintViolation",
+    "RevisionRequest",
+    "RevisionResult",
     "AdoptedPerception",
     "DerivedScheme",
     "SchemeEvaluation",
@@ -66,7 +77,12 @@ __all__ = [
     "check_assignment",
     "derive_scheme",
     "derive_schemes",
+    "derive_revised_schemes",
     "adopted_perception_facts",
     "evaluate_schemes",
+    "evaluate_revision",
     "attribute_difference",
+    "request_revision",
+    "rederive_revision",
+    "assignment_constraint_violations",
 ]

@@ -19,7 +19,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclass_replace
 from itertools import product
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -54,6 +54,40 @@ class WindowConstraint:
 
 
 @dataclass(frozen=True)
+class ConstraintViolation:
+    """感知组合不满足先后/同刻约束；这不是交通碰撞结论。"""
+
+    assignment: Tuple[Tuple[str, int], ...]
+    constraint: WindowConstraint
+    reason: str
+
+
+@dataclass(frozen=True)
+class RevisionRequest:
+    """已保存但尚未采用的感知范围/约束/延迟修订请求。"""
+
+    revision_id: str
+    windows: Tuple[PerceptionWindow, ...]
+    constraints: Tuple[WindowConstraint, ...] = ()
+    created_tick_ms: int = 0
+    base_scheme_id: Optional[str] = None
+    status: str = "pending"  # pending / adopted / dismissed
+
+
+@dataclass(frozen=True)
+class RevisionResult:
+    """重派生结果：可执行方案与约束不可行组合分开返回。"""
+
+    request: RevisionRequest
+    schemes: Tuple[DerivedScheme, ...]
+    constraint_violations: Tuple[ConstraintViolation, ...]
+
+    @property
+    def constraint_failures(self) -> Tuple[ConstraintViolation, ...]:
+        return self.constraint_violations
+
+
+@dataclass(frozen=True)
 class AdoptedPerception:
     """方案实际采用的感知时刻与反应延迟。"""
 
@@ -84,6 +118,10 @@ class SchemeEvaluation:
     def clear(self) -> bool:
         return not self.collisions
 
+    @property
+    def outcome(self) -> str:
+        return "clear" if self.clear else "traffic_collision"
+
 
 @dataclass(frozen=True)
 class UncertaintyReport:
@@ -93,10 +131,20 @@ class UncertaintyReport:
     horizon_ms: int
     tick_ms: int
     total_assignments: Optional[int]
+    constraint_violations: Tuple[ConstraintViolation, ...] = ()
 
     @property
     def conflicts(self) -> Tuple[SchemeEvaluation, ...]:
         return tuple(evaluation for evaluation in self.evaluations if not evaluation.clear)
+
+    @property
+    def traffic_conflicts(self) -> Tuple[SchemeEvaluation, ...]:
+        """实际交通碰撞；约束违规不计入该状态。"""
+        return self.conflicts
+
+    @property
+    def constraint_failures(self) -> Tuple[ConstraintViolation, ...]:
+        return self.constraint_violations
 
     @property
     def clears(self) -> Tuple[SchemeEvaluation, ...]:
@@ -107,10 +155,16 @@ class UncertaintyReport:
         return len(self.evaluations)
 
     @property
+    def examined_count(self) -> int:
+        """已核对的离散组合数：可执行方案 + 明确违反约束的组合。"""
+        invalid_assignments = {item.assignment for item in self.constraint_violations}
+        return self.explored_count + len(invalid_assignments)
+
+    @property
     def unexplored_count(self) -> Optional[int]:
         if self.total_assignments is None:
             return None
-        return max(0, self.total_assignments - self.explored_count)
+        return max(0, self.total_assignments - self.examined_count)
 
     @property
     def covers_full_range(self) -> bool:
@@ -119,7 +173,7 @@ class UncertaintyReport:
     def conclusion(self) -> str:
         """人工可核对的结论；离散结果不得显示成连续安全结论。"""
         parts = [
-            f"已考察 {self.explored_count} 个感知组合"
+            f"已考察 {self.examined_count} 个感知组合"
             + (
                 f"（共 {self.total_assignments} 个）"
                 if self.total_assignments is not None
@@ -128,6 +182,11 @@ class UncertaintyReport:
             f"{len(self.conflicts)} 个方案在 {self.horizon_ms}ms 内发现冲突",
             f"{len(self.clears)} 个方案在 {self.horizon_ms}ms 内未见冲突",
         ]
+        if self.constraint_violations:
+            parts.append(
+                f"{len(self.constraint_violations)} 个感知组合不满足约束"
+                "（约束失败，不等同于交通碰撞）"
+            )
         unexplored = self.unexplored_count
         if unexplored is None:
             parts.append("组合总数未知，结果仅为抽样，不能据此判定范围安全")
@@ -187,6 +246,173 @@ def enumerate_assignments(
         if _satisfies(assignment, constraints):
             result.append(assignment)
     return tuple(result)
+
+
+def assignment_constraint_violations(
+    assignment: Mapping[str, int],
+    constraints: Sequence[WindowConstraint],
+) -> Tuple[ConstraintViolation, ...]:
+    """返回一个具体组合违反的全部刺激先后约束。"""
+    violations: List[ConstraintViolation] = []
+    ordered = tuple(sorted(assignment.items()))
+    for constraint in constraints:
+        first = assignment.get(constraint.first_id)
+        second = assignment.get(constraint.second_id)
+        if first is None or second is None:
+            raise ValueError(
+                f"constraint references unknown window: {constraint}"
+            )
+        if constraint.kind == "after" and second < first:
+            violations.append(
+                ConstraintViolation(
+                    assignment=ordered,
+                    constraint=constraint,
+                    reason=(
+                        f"{constraint.second_id}={second}ms 早于 "
+                        f"{constraint.first_id}={first}ms，不满足 after"
+                    ),
+                )
+            )
+        elif constraint.kind == "same" and second != first:
+            violations.append(
+                ConstraintViolation(
+                    assignment=ordered,
+                    constraint=constraint,
+                    reason=(
+                        f"{constraint.second_id}={second}ms 与 "
+                        f"{constraint.first_id}={first}ms 不同刻，不满足 same"
+                    ),
+                )
+            )
+        elif constraint.kind not in {"after", "same"}:
+            raise ValueError(f"unknown constraint kind: {constraint.kind!r}")
+    return tuple(violations)
+
+
+def request_revision(
+    engine: ReplayEngine,
+    windows: Sequence[PerceptionWindow],
+    constraints: Sequence[WindowConstraint] = (),
+    revision_id: str = "revision-1",
+) -> RevisionRequest:
+    """登记修订请求；只保存，不改变当前方案已采用的事实和待响应动作。"""
+    windows = tuple(windows)
+    constraints = tuple(constraints)
+    _validate_windows(windows)
+    for window in windows:
+        window_ticks(window, engine.scenario.tick_ms)
+    referenced = {window.window_id for window in windows}
+    for constraint in constraints:
+        if constraint.first_id not in referenced or constraint.second_id not in referenced:
+            raise ValueError(f"constraint references unknown window: {constraint}")
+        if constraint.kind not in {"after", "same"}:
+            raise ValueError(f"unknown constraint kind: {constraint.kind!r}")
+    request = RevisionRequest(
+        revision_id=revision_id,
+        windows=windows,
+        constraints=constraints,
+        created_tick_ms=engine.now_ms,
+        base_scheme_id=engine.scenario.branch_id,
+    )
+    engine.pending_revision = request
+    return request
+
+
+def rederive_revision(
+    engine: ReplayEngine,
+    scheme_prefix: Optional[str] = None,
+    at_ms: Optional[int] = None,
+    base_changes: Optional[BranchChanges] = None,
+) -> RevisionResult:
+    """用户确认后按保存的修订请求重派生；当前旧方案不被原地修改。"""
+    request = engine.pending_revision
+    if request is None:
+        raise ValueError("no pending revision request")
+    prefix = scheme_prefix or request.revision_id
+    source_engine = _clone_runtime_engine(engine)
+    revised_window_ids = {window.window_id for window in request.windows}
+    dropped_event_ids: List[str] = []
+    for event in engine.scenario.events:
+        if (
+            event.action.get("type") == "inject_perception"
+            and event.action.get("observed", {}).get("window_id") in revised_window_ids
+        ):
+            dropped_event_ids.append(event.event_id)
+            dropped_event_ids.append(f"injected-perception:{event.event_id}")
+            dropped_event_ids.append(f"injected-response:{event.event_id}")
+    existing_changes = base_changes or BranchChanges()
+    revision_changes = BranchChanges(
+        vehicle_routes=existing_changes.vehicle_routes,
+        pedestrian_routes=existing_changes.pedestrian_routes,
+        pedestrian_speeds=existing_changes.pedestrian_speeds,
+        signal_plans=existing_changes.signal_plans,
+        vehicle_reaction_params=existing_changes.vehicle_reaction_params,
+        vehicle_reaction_delays=existing_changes.vehicle_reaction_delays,
+        extra_events=existing_changes.extra_events,
+        drop_event_ids=(
+            tuple(existing_changes.drop_event_ids) + tuple(dropped_event_ids)
+        ),
+    )
+    result = derive_revised_schemes(
+        source_engine,
+        prefix,
+        request.windows,
+        request.constraints,
+        at_ms=at_ms,
+        base_changes=revision_changes,
+    )
+    adopted_request = dataclass_replace(request, status="adopted")
+    engine.pending_revision = adopted_request
+    return dataclass_replace(result, request=adopted_request)
+
+
+def derive_revised_schemes(
+    engine: ReplayEngine,
+    scheme_prefix: str,
+    windows: Sequence[PerceptionWindow],
+    constraints: Sequence[WindowConstraint] = (),
+    at_ms: Optional[int] = None,
+    base_changes: Optional[BranchChanges] = None,
+) -> RevisionResult:
+    """枚举修订后全部离散组合；合法组合派生，非法组合只作为约束违规报告。"""
+    windows = tuple(windows)
+    constraints = tuple(constraints)
+    tick_ms = engine.scenario.tick_ms
+    _validate_windows(windows)
+    choices = [window_ticks(window, tick_ms) for window in windows]
+    schemes: List[DerivedScheme] = []
+    violations: List[ConstraintViolation] = []
+    index = 0
+    placeholder_request = RevisionRequest(
+        revision_id=scheme_prefix,
+        windows=windows,
+        constraints=constraints,
+    )
+    for combo in product(*choices):
+        assignment = {
+            window.window_id: chosen for window, chosen in zip(windows, combo)
+        }
+        combo_violations = assignment_constraint_violations(assignment, constraints)
+        if combo_violations:
+            violations.extend(combo_violations)
+            continue
+        schemes.append(
+            derive_scheme(
+                engine,
+                f"{scheme_prefix}-{index}",
+                windows,
+                assignment,
+                constraints=constraints,
+                at_ms=at_ms,
+                base_changes=base_changes,
+            )
+        )
+        index += 1
+    return RevisionResult(
+        request=placeholder_request,
+        schemes=tuple(schemes),
+        constraint_violations=tuple(violations),
+    )
 
 
 def check_assignment(
@@ -323,6 +549,7 @@ def evaluate_schemes(
     schemes: Sequence[DerivedScheme],
     until_ms: int,
     total_assignments: Optional[int] = None,
+    constraint_violations: Sequence[ConstraintViolation] = (),
 ) -> UncertaintyReport:
     """逐个重放方案并汇总；未见冲突与已发现冲突分开列出。"""
     evaluations: List[SchemeEvaluation] = []
@@ -351,6 +578,20 @@ def evaluate_schemes(
         horizon_ms=until_ms,
         tick_ms=tick_ms if tick_ms is not None else 0,
         total_assignments=total_assignments,
+        constraint_violations=tuple(constraint_violations),
+    )
+
+
+def evaluate_revision(result: RevisionResult, until_ms: int) -> UncertaintyReport:
+    """评估重派生结果，并同时保留约束失败组合。"""
+    invalid_assignments = {
+        violation.assignment for violation in result.constraint_violations
+    }
+    return evaluate_schemes(
+        result.schemes,
+        until_ms,
+        total_assignments=len(result.schemes) + len(invalid_assignments),
+        constraint_violations=result.constraint_violations,
     )
 
 
@@ -471,3 +712,11 @@ def _records_at(engine: ReplayEngine, tick_ms: int) -> Tuple[object, ...]:
     records.extend(record for record in engine.journal if record.tick_ms == tick_ms)
     return tuple(records)
 
+
+def _clone_runtime_engine(engine: ReplayEngine) -> ReplayEngine:
+    from .storage import load_run, save_run
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as temporary:
+        save_run(engine, temporary.name)
+        return load_run(temporary.name)

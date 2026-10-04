@@ -3,6 +3,7 @@ import pytest
 from scenario_replay import (
     BranchChanges,
     PerceptionWindow,
+    RevisionResult,
     ReplayEngine,
     Scenario,
     ScriptedEvent,
@@ -14,9 +15,12 @@ from scenario_replay import (
     check_assignment,
     derive_scheme,
     derive_schemes,
+    derive_revised_schemes,
     enumerate_assignments,
     evaluate_schemes,
     load_run,
+    rederive_revision,
+    request_revision,
     save_run,
 )
 
@@ -365,3 +369,114 @@ def test_nested_derivation_from_scheme_keeps_event_ownership():
         assert len(nested_facts) == 1
         assert nested_facts[0].tick_ms == scheme.assignment["w-nested"]
 
+
+def test_revision_saved_reopened_is_not_adopted_until_user_rederives(tmp_path):
+    scheme = derive_scheme(
+        ReplayEngine(uncertain_lead_brake_scenario()),
+        "original",
+        [brake_window(earliest=400, latest=400, delay=500)],
+        {"w-brake": 400},
+        base_changes=brake_base_changes(),
+    ).engine
+    scheme.run_to(600)
+    original_pending_id = scheme.pending_response_records()[0].response_id
+    original_due = scheme.pending_response_records()[0].due_tick_ms
+
+    request_revision(
+        scheme,
+        [brake_window(earliest=700, latest=800, delay=500)],
+        revision_id="later-range",
+    )
+    # 保存重开前后，修订都只是待确认输入：旧感知事实和待响应动作保持不变
+    assert scheme.pending_revision.status == "pending"
+    assert adopted_perception_facts(scheme)[0].tick_ms == 400
+    assert scheme.pending_response_records()[0].response_id == original_pending_id
+    path = save_run(scheme, tmp_path / "revision-pending.json")
+
+    reopened = load_run(path)
+    assert reopened.pending_revision.status == "pending"
+    assert adopted_perception_facts(reopened)[0].tick_ms == 400
+    assert reopened.pending_response_records()[0].response_id == original_pending_id
+    assert reopened.pending_response_records()[0].due_tick_ms == original_due
+
+    result = rederive_revision(reopened, scheme_prefix="revised")
+    assert reopened.pending_revision.status == "adopted"
+    # 原方案仍保留原采用事实；新方案不能重复或借用旧响应事实
+    assert adopted_perception_facts(reopened)[0].tick_ms == 400
+    assert reopened.pending_response_records()[0].response_id == original_pending_id
+    assert [s.assignment["w-brake"] for s in result.schemes] == [700, 800]
+    revised = result.schemes[0].engine
+    revised.run_to(700)
+    revised_facts = adopted_perception_facts(revised)
+    assert len(revised_facts) == 1
+    assert revised_facts[0].tick_ms == 700
+    pending = revised.pending_response_records()
+    assert len(pending) == 1
+    assert pending[0].perception_id.startswith("injected-perception:revised-0")
+    assert pending[0].due_tick_ms == 1200
+
+
+def test_constraint_violations_are_reported_separately_from_collisions():
+    signal_window = PerceptionWindow(
+        "w-signal", "follower", "signal_red", "j1", 700, 800, 1000
+    )
+    brake_window = PerceptionWindow(
+        "w-brake", "follower", "lead_brake", "leader", 600, 800, 100
+    )
+    constraints = [WindowConstraint("after", "w-signal", "w-brake")]
+
+    result = derive_revised_schemes(
+        ReplayEngine(uncertain_lead_brake_scenario()),
+        "ordered",
+        [signal_window, brake_window],
+        constraints,
+        base_changes=brake_base_changes(),
+    )
+    assert isinstance(result, RevisionResult)
+    assert [s.assignment["w-signal"] for s in result.schemes] == [700, 700, 800]
+    assert [s.assignment["w-brake"] for s in result.schemes] == [700, 800, 800]
+    assert len(result.constraint_violations) == 3
+    assert all(
+        "after" in violation.reason for violation in result.constraint_violations
+    )
+
+    report = evaluate_schemes(
+        result.schemes, 2500, total_assignments=6,
+        constraint_violations=result.constraint_violations,
+    )
+    assert report.explored_count == 3
+    assert report.examined_count == 6
+    assert report.unexplored_count == 0
+    assert len(report.constraint_violations) == 3
+    conclusion = report.conclusion()
+    assert "3 个感知组合不满足约束" in conclusion
+    assert "约束失败，不等同于交通碰撞" in conclusion
+
+
+def test_revision_can_change_reaction_delay_and_traces_first_divergence():
+    original = derive_scheme(
+        ReplayEngine(uncertain_lead_brake_scenario()),
+        "quick-original",
+        [brake_window(earliest=400, latest=400, delay=500)],
+        {"w-brake": 400},
+        base_changes=brake_base_changes(),
+    ).engine
+    original.run_to(600)
+    request_revision(
+        original,
+        [brake_window(earliest=400, latest=400, delay=700)],
+        revision_id="slower-response",
+    )
+    result = rederive_revision(original, scheme_prefix="slow-revised")
+    revised = result.schemes[0].engine
+
+    assert adopted_perception_facts(revised)[0].delay_ms == 700
+    revised.run_to(900)
+    pending = revised.pending_response_records()
+    assert len(pending) == 1
+    assert pending[0].due_tick_ms == 1100
+    assert original.pending_response_records()[0].due_tick_ms == 900
+    attr = attribute_difference(original, revised, 1200)
+    assert attr.causes == ("reaction_delay",)
+    assert attr.divergence.tick_ms == 800
+    assert attr.first_events_a

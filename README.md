@@ -42,6 +42,12 @@
   安全；UncertaintyReport.conclusion 明确标注结果只是 tick 级离散采样
   与有限时域内的对照，不构成连续时间安全证明。修改不确定范围只派生
   新方案，不回写旧方案的感知事实；已退出车辆的待响应事件不进入派生方案。
+- 修订后重派生：request_revision 只登记并随 save_run 保存新的感知范围、
+  刺激先后约束与反应延迟；load_run 重开后调用 rederive_revision 才真正采用。
+  旧方案保留原感知事实、待响应事件和实际碰撞；新方案重新注入修订后的感知，
+  不重复执行也不借用旧响应。derive_revised_schemes/evaluate_revision 把
+  “不满足新约束”的离散组合与“实际交通碰撞”的可执行方案分别报告，
+  已核对组合与未验证范围分开计数，并可用 attribute_difference 追到首次分歧。
 - 差异归因：attribute_difference 说明两个方案的结果差异来自感知选择、
   反应延迟还是后续信号安排，并给出首次使结果分开的交通事件
   （first_divergence 时刻的感知、响应与脚本事件记录）。
