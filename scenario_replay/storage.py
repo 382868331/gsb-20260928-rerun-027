@@ -179,6 +179,10 @@ def save_run(engine: ReplayEngine, path: str | Path) -> Path:
             for r in engine.responses
         ],
         "pending_revision": engine.pending_revision,
+        "pending_revisions": dict(engine.pending_revisions),
+        "selected_revision_id": engine.selected_revision_id,
+        "revision_selection_history": list(engine.revision_selection_history),
+        "adopted_revisions": dict(engine.adopted_revisions),
     }
     path = Path(path)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -292,6 +296,18 @@ def load_run(path: str | Path) -> ReplayEngine:
     engine._handled_responses = {r.response_id for r in engine.responses}
     pending_revision = payload.get("pending_revision")
     engine.pending_revision = dict(pending_revision) if pending_revision else None
+    engine.pending_revisions = {
+        str(candidate_id): dict(data)
+        for candidate_id, data in (payload.get("pending_revisions") or {}).items()
+    }
+    engine.selected_revision_id = payload.get("selected_revision_id")
+    engine.revision_selection_history = list(
+        payload.get("revision_selection_history") or []
+    )
+    engine.adopted_revisions = {
+        str(candidate_id): dict(data)
+        for candidate_id, data in (payload.get("adopted_revisions") or {}).items()
+    }
     return engine
 
 

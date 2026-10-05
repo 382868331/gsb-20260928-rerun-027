@@ -139,9 +139,18 @@ class ReplayEngine:
         self._handled_responses: set[str] = set()
         self._collision_pairs: set[Tuple[str, str]] = set()
         self.paused = False
-        # 已保存但尚未由用户确认重派生的输入修订。
+        # 已保存但尚未由用户确认重派生的输入修订（旧版单候选接口）。
         # 这里只保存不透明数据；重派生前不得改变场景事件或反应参数。
         self.pending_revision: Optional[dict] = None
+        # 同一交通方案的多份未确认感知修订候选：candidate_id -> 不透明修订数据。
+        # 多候选互不覆盖；派生其中一份不删除其他候选，也不改写原方案事实。
+        self.pending_revisions: Dict[str, dict] = {}
+        # 当前选择（已派生确认）的候选；撤销一次选择会回到上一个选择。
+        self.selected_revision_id: Optional[str] = None
+        self.revision_selection_history: List[Optional[str]] = []
+        # 已派生确认的候选修订数据：撤销选择时据此把候选退回未决集合，
+        # 原方案事实与其他候选不受影响。
+        self.adopted_revisions: Dict[str, dict] = {}
 
     # ---- 基础查询 ----
 

@@ -187,6 +187,11 @@ class PerceptionRevision:
     horizon_ms: Optional[int] = None
     created_at_ms: Optional[int] = None
     reason: Optional[str] = None
+    # 多候选身份：candidate_id 唯一标识同一份交通方案下的未决修订；
+    # based_on 记录它从哪个候选（或原方案 None）继续编辑，形成可追溯链。
+    candidate_id: Optional[str] = None
+    based_on: Optional[str] = None
+    note: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -195,6 +200,43 @@ class RevisionResult:
     schemes: Tuple[DerivedScheme, ...]
     constraint_violations: Tuple[ConstraintViolation, ...]
     report: Optional[UncertaintyReport]
+
+
+@dataclass(frozen=True)
+class WindowImpact:
+    """一份候选对单个观测范围的影响：观测区间、可选时刻数与反应延迟。"""
+
+    window_id: str
+    vehicle_id: str
+    stimulus: str
+    source_id: str
+    earliest_ms: int
+    latest_ms: int
+    tick_choices: int
+    delay_ms: int
+
+
+@dataclass(frozen=True)
+class CandidateComparison:
+    """一份未决候选相对原方案的影响汇总，供多候选并排比较。"""
+
+    candidate_id: str
+    based_on: Optional[str]
+    note: Optional[str]
+    windows: Tuple[WindowImpact, ...]
+    stimulus_order: Tuple[WindowConstraint, ...]
+    reaction_delays_ms: Tuple[Tuple[str, int], ...]
+    explored_assignments: Tuple[Tuple[Tuple[str, int], ...], ...]
+    explored_count: int
+    total_assignments: int
+    constraint_excluded_count: int
+    unexplored_count: int
+    collisions_by_scheme: Tuple[Tuple[str, Tuple[CollisionRecord, ...]], ...]
+    horizon_ms: int
+    first_divergence_from_base: Optional[Divergence]
+    first_divergence_scheme_id: Optional[str]
+    fact_divergence_from_base: Optional[Divergence]
+    fact_divergence_scheme_id: Optional[str]
 
 
 def window_ticks(window: PerceptionWindow, tick_ms: int) -> Tuple[int, ...]:
@@ -416,25 +458,153 @@ def stage_perception_revision(
     return revision
 
 
-def load_pending_revision(engine: ReplayEngine) -> Optional[PerceptionRevision]:
-    if not engine.pending_revision:
-        return None
-    return revision_from_dict(engine.pending_revision)
-
-
-def rederive_pending_revision(
+def stage_revision_candidate(
     engine: ReplayEngine,
+    candidate_id: str,
+    windows: Sequence[PerceptionWindow],
+    constraints: Sequence[WindowConstraint] = (),
+    *,
+    at_ms: Optional[int] = None,
+    base_changes: Optional[BranchChanges] = None,
+    horizon_ms: Optional[int] = None,
+    reason: Optional[str] = None,
+    note: Optional[str] = None,
+    based_on: Optional[str] = None,
+) -> PerceptionRevision:
+    """暂存一份命名候选；同一份交通方案可同时保留任意多份未决候选。
+
+    多次编辑同一 candidate_id 是幂等更新（不产生重复候选）；不同
+    candidate_id 互不覆盖，最后编辑的一份不会抹掉先前候选。
+    based_on 可为另一候选 id，表示该候选由它继续编辑，形成
+    “首次分歧”可追溯链；为 None 表示相对原交通方案修订。
+    """
+    if not candidate_id:
+        raise ValueError("candidate_id must be a non-empty string")
+    windows = tuple(windows)
+    constraints = tuple(constraints)
+    tick_ms = engine.scenario.tick_ms
+    for window in windows:
+        window_ticks(window, tick_ms)
+    for constraint in constraints:
+        ids = {window.window_id for window in windows}
+        if constraint.first_id not in ids or constraint.second_id not in ids:
+            raise ValueError(f"constraint references unknown window: {constraint}")
+        if constraint.kind not in {"after", "same"}:
+            raise ValueError(f"unknown constraint kind: {constraint.kind!r}")
+    if based_on is not None and based_on not in engine.pending_revisions:
+        raise ValueError(f"based_on candidate {based_on!r} is not staged")
+
+    revision = PerceptionRevision(
+        windows=windows,
+        constraints=constraints,
+        base_scenario=scenario_to_dict(_revision_base_scenario(engine)),
+        base_changes=branch_changes_to_dict(base_changes) if base_changes else None,
+        at_ms=at_ms,
+        scheme_prefix=candidate_id,
+        horizon_ms=horizon_ms,
+        created_at_ms=engine.now_ms,
+        reason=reason,
+        candidate_id=candidate_id,
+        based_on=based_on,
+        note=note,
+    )
+    engine.pending_revisions[candidate_id] = revision_to_dict(revision)
+    return revision
+
+
+def load_revision_candidate(
+    engine: ReplayEngine, candidate_id: str
+) -> Optional[PerceptionRevision]:
+    data = engine.pending_revisions.get(candidate_id)
+    return revision_from_dict(data) if data else None
+
+
+def list_revision_candidates(engine: ReplayEngine) -> Tuple[PerceptionRevision, ...]:
+    """按暂存顺序返回全部未决候选；候选集合持久化并重开后仍在。"""
+    return tuple(
+        revision_from_dict(engine.pending_revisions[candidate_id])
+        for candidate_id in engine.pending_revisions
+    )
+
+
+def discard_revision_candidate(engine: ReplayEngine, candidate_id: str) -> None:
+    """丢弃一份候选；当前选择或历史链指向它时一并清理引用。"""
+    engine.pending_revisions.pop(candidate_id, None)
+    engine.adopted_revisions.pop(candidate_id, None)
+    engine.revision_selection_history = [
+        item for item in engine.revision_selection_history if item != candidate_id
+    ]
+    if engine.selected_revision_id == candidate_id:
+        engine.selected_revision_id = (
+        engine.revision_selection_history[-1]
+        if engine.revision_selection_history
+        else None
+    )
+
+
+def derive_revision_candidate(
+    engine: ReplayEngine,
+    candidate_id: str,
     *,
     adopt: bool = True,
     evaluate_until_ms: Optional[int] = None,
 ) -> RevisionResult:
-    """用户确认后才采用暂存修订；原引擎和旧方案事实不被原地改写。"""
-    stored = load_pending_revision(engine)
-    if stored is None:
-        raise ValueError("no pending perception revision")
+    """显式派生某一份未决候选；其他候选与原方案事实一律保留。
+
+    采用（adopt=True）只登记选择并把该候选从“未决”集合移出，
+    不覆盖任何其他候选，也不改写引擎内原方案的场景与事件事实。
+    重复确认同一候选是幂等操作，历史中不重复登记。
+    """
+    data = engine.pending_revisions.get(candidate_id)
+    if data is None:
+        already_selected = engine.selected_revision_id == candidate_id
+        if already_selected and candidate_id in engine.adopted_revisions:
+            data = engine.adopted_revisions[candidate_id]  # 重复确认：幂等重放
+        else:
+            raise ValueError(f"no staged revision candidate {candidate_id!r}")
+    else:
+        already_selected = engine.selected_revision_id == candidate_id
+    result = _rederive_revision(
+        revision_from_dict(data),
+        evaluate_until_ms=evaluate_until_ms,
+    )
+    if adopt:
+        engine.adopted_revisions[candidate_id] = dict(data)
+        if not already_selected:
+            engine.pending_revisions.pop(candidate_id, None)
+        engine.pending_revision = None
+        if not already_selected:
+            engine.revision_selection_history.append(engine.selected_revision_id)
+            engine.selected_revision_id = candidate_id
+    return result
+
+
+def undo_revision_selection(engine: ReplayEngine) -> Optional[str]:
+    """撤销最近一次选择并改回上一个选择（默认原方案 None）。
+
+    撤销不删除任何候选：被撤销的候选重新回到未决集合（若其修订
+    数据仍可从上次派生结果外保留——见说明），从而允许改用另一份。
+    为支持反复撤销/重选，撤销时会把当前候选重新暂存。
+    """
+    if not engine.revision_selection_history:
+        return engine.selected_revision_id
+    current = engine.selected_revision_id
+    previous = engine.revision_selection_history.pop()
+    if current is not None:
+        adopted = engine.adopted_revisions.pop(current, None)
+        if adopted is not None:
+            engine.pending_revisions[current] = adopted
+    engine.selected_revision_id = previous
+    return previous
+
+
+def _rederive_revision(
+    stored: PerceptionRevision,
+    *,
+    evaluate_until_ms: Optional[int] = None,
+) -> RevisionResult:
     if stored.base_scenario is None:
         raise ValueError("pending revision does not contain a replayable base scenario")
-
     base = ReplayEngine(scenario_from_dict(dict(stored.base_scenario)))
     base_changes = (
         branch_changes_from_dict(dict(stored.base_changes))
@@ -470,14 +640,247 @@ def rederive_pending_revision(
         if horizon is not None
         else None
     )
-    if adopt:
-        engine.pending_revision = None
     return RevisionResult(
         revision=stored,
         schemes=schemes,
         constraint_violations=violations,
         report=report,
     )
+
+
+def load_pending_revision(engine: ReplayEngine) -> Optional[PerceptionRevision]:
+    if not engine.pending_revision:
+        return None
+    return revision_from_dict(engine.pending_revision)
+
+
+def rederive_pending_revision(
+    engine: ReplayEngine,
+    *,
+    adopt: bool = True,
+    evaluate_until_ms: Optional[int] = None,
+) -> RevisionResult:
+    """用户确认后才采用暂存修订；原引擎和旧方案事实不被原地改写。"""
+    stored = load_pending_revision(engine)
+    if stored is None:
+        raise ValueError("no pending perception revision")
+    result = _rederive_revision(stored, evaluate_until_ms=evaluate_until_ms)
+    if adopt:
+        engine.pending_revision = None
+    return result
+
+
+def compare_revision_candidates(
+    candidates: Sequence["RevisionResult"],
+    until_ms: Optional[int] = None,
+    base_engine: Optional[ReplayEngine] = None,
+) -> Tuple[CandidateComparison, ...]:
+    """并排比较多份候选影响的观测范围、刺激顺序与反应延迟。
+
+    每份候选分别给出：约束排除的离散组合数、实际重放出的碰撞、
+    已探索的离散组合、未验证（未考察）范围，以及相对原方案的
+    物理轨迹首处分歧与采用事实首处分歧。约束排除与实际碰撞始终
+    分开计数，互不混入。
+    """
+    return tuple(
+        _compare_one(result, until_ms=until_ms, base_engine=base_engine)
+        for result in candidates
+    )
+
+
+def _compare_one(
+    result: "RevisionResult",
+    *,
+    until_ms: Optional[int],
+    base_engine: Optional[ReplayEngine],
+) -> CandidateComparison:
+    stored = result.revision
+    tick_ms = (
+        result.schemes[0].engine.scenario.tick_ms
+        if result.schemes
+        else (base_engine.scenario.tick_ms if base_engine is not None else 0)
+    )
+    horizon = until_ms if until_ms is not None else stored.horizon_ms
+    windows = tuple(
+        WindowImpact(
+            window_id=window.window_id,
+            vehicle_id=window.vehicle_id,
+            stimulus=window.stimulus,
+            source_id=window.source_id,
+            earliest_ms=window.earliest_ms,
+            latest_ms=window.latest_ms,
+            tick_choices=len(window_ticks(window, tick_ms)) if tick_ms else 0,
+            delay_ms=window.delay_ms,
+        )
+        for window in stored.windows
+    )
+    explored_assignments = tuple(
+        tuple(sorted(scheme.assignment.items())) for scheme in result.schemes
+    )
+    collisions_by_scheme: List[Tuple[str, Tuple[CollisionRecord, ...]]] = []
+    total = len(result.schemes) + len(result.constraint_violations)
+    if horizon is not None:
+        for scheme in result.schemes:
+            scheme.engine.seek(horizon)
+            collisions_by_scheme.append(
+                (
+                    scheme.scheme_id,
+                    tuple(
+                        collision
+                        for collision in scheme.engine.collisions
+                        if collision.tick_ms <= horizon
+                    ),
+                )
+            )
+    unexplored = max(
+        0, total - len(result.schemes) - len(result.constraint_violations)
+    )
+    first_divergence_from_base = None
+    first_divergence_scheme_id = None
+    fact_divergence_from_base = None
+    fact_divergence_scheme_id = None
+    if base_engine is not None and horizon is not None and result.schemes:
+        for scheme in result.schemes:
+            divergence = first_divergence(base_engine, scheme.engine, horizon)
+            if divergence is not None:
+                first_divergence_from_base = divergence
+                first_divergence_scheme_id = scheme.scheme_id
+                break
+        for scheme in result.schemes:
+            attribution = attribute_difference(base_engine, scheme.engine, horizon)
+            if attribution.fact_divergence is not None:
+                fact_divergence_from_base = attribution.fact_divergence
+                fact_divergence_scheme_id = scheme.scheme_id
+                break
+    return CandidateComparison(
+        candidate_id=stored.candidate_id or stored.scheme_prefix,
+        based_on=stored.based_on,
+        note=stored.note,
+        windows=windows,
+        stimulus_order=stored.constraints,
+        reaction_delays_ms=tuple(
+            (window.window_id, window.delay_ms) for window in stored.windows
+        ),
+        explored_assignments=explored_assignments,
+        explored_count=len(result.schemes),
+        total_assignments=total,
+        constraint_excluded_count=len(result.constraint_violations),
+        unexplored_count=unexplored,
+        collisions_by_scheme=tuple(collisions_by_scheme),
+        horizon_ms=horizon if horizon is not None else 0,
+        first_divergence_from_base=first_divergence_from_base,
+        first_divergence_scheme_id=first_divergence_scheme_id,
+        fact_divergence_from_base=fact_divergence_from_base,
+        fact_divergence_scheme_id=fact_divergence_scheme_id,
+    )
+
+
+def _divergence_to_dict(divergence: Optional[Divergence]) -> Optional[Dict[str, Any]]:
+    if divergence is None:
+        return None
+    return {
+        "tick_ms": divergence.tick_ms,
+        "aspects": list(divergence.aspects),
+        "actors": list(divergence.actors),
+        "signals": list(divergence.signals),
+    }
+
+
+def candidate_comparisons_to_dict(
+    comparisons: Sequence[CandidateComparison],
+) -> Dict[str, Any]:
+    """导出 JSON 可序列化的比较结果；约束排除与实际碰撞分别说明。"""
+    return {
+        "candidates": [
+            {
+                "candidate_id": comparison.candidate_id,
+                "based_on": comparison.based_on,
+                "note": comparison.note,
+                "observation_ranges": [
+                    {
+                        "window_id": impact.window_id,
+                        "vehicle_id": impact.vehicle_id,
+                        "stimulus": impact.stimulus,
+                        "source_id": impact.source_id,
+                        "earliest_ms": impact.earliest_ms,
+                        "latest_ms": impact.latest_ms,
+                        "tick_choices": impact.tick_choices,
+                        "reaction_delay_ms": impact.delay_ms,
+                    }
+                    for impact in comparison.windows
+                ],
+                "stimulus_order": [
+                    {
+                        "kind": constraint.kind,
+                        "first_id": constraint.first_id,
+                        "second_id": constraint.second_id,
+                    }
+                    for constraint in comparison.stimulus_order
+                ],
+                "reaction_delays_ms": [
+                    {"window_id": window_id, "delay_ms": delay}
+                    for window_id, delay in comparison.reaction_delays_ms
+                ],
+                "explored_combinations": [
+                    {window_id: tick for window_id, tick in assignment}
+                    for assignment in comparison.explored_assignments
+                ],
+                "explored_count": comparison.explored_count,
+                "total_combinations": comparison.total_assignments,
+                "constraint_excluded_count": comparison.constraint_excluded_count,
+                "unverified_count": comparison.unexplored_count,
+                "actual_collisions": [
+                    {
+                        "scheme_id": scheme_id,
+                        "collisions": [
+                            {
+                                "tick_ms": collision.tick_ms,
+                                "actor_a": collision.actor_a,
+                                "actor_b": collision.actor_b,
+                                "distance": collision.distance,
+                                "reason": collision.reason,
+                            }
+                            for collision in collisions
+                        ],
+                    }
+                    for scheme_id, collisions in comparison.collisions_by_scheme
+                    if collisions
+                ],
+                "horizon_ms": comparison.horizon_ms,
+                "first_divergence_from_base": _divergence_to_dict(
+                    comparison.first_divergence_from_base
+                ),
+                "first_divergence_scheme_id": comparison.first_divergence_scheme_id,
+                "first_fact_divergence_from_base": _divergence_to_dict(
+                    comparison.fact_divergence_from_base
+                ),
+                "first_fact_divergence_scheme_id": comparison.fact_divergence_scheme_id,
+            }
+            for comparison in comparisons
+        ],
+    }
+
+
+def export_revision_comparison(
+    candidates: Sequence["RevisionResult"],
+    path: Optional[str] = None,
+    *,
+    until_ms: Optional[int] = None,
+    base_engine: Optional[ReplayEngine] = None,
+) -> Dict[str, Any]:
+    """导出多候选比较；给 path 时同时写 JSON 文件，始终返回可序列化字典。"""
+    payload = candidate_comparisons_to_dict(
+        compare_revision_candidates(
+            candidates, until_ms=until_ms, base_engine=base_engine
+        )
+    )
+    if path is not None:
+        from pathlib import Path
+
+        Path(path).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    return payload
 
 
 def _revision_base_scenario(engine: ReplayEngine) -> Scenario:
@@ -612,6 +1015,9 @@ def revision_to_dict(revision: PerceptionRevision) -> Dict[str, Any]:
         "horizon_ms": revision.horizon_ms,
         "created_at_ms": revision.created_at_ms,
         "reason": revision.reason,
+        "candidate_id": revision.candidate_id,
+        "based_on": revision.based_on,
+        "note": revision.note,
     }
 
 
@@ -648,6 +1054,9 @@ def revision_from_dict(data: Mapping[str, Any]) -> PerceptionRevision:
         horizon_ms=int(data["horizon_ms"]) if data.get("horizon_ms") is not None else None,
         created_at_ms=int(data["created_at_ms"]) if data.get("created_at_ms") is not None else None,
         reason=data.get("reason"),
+        candidate_id=data.get("candidate_id"),
+        based_on=data.get("based_on"),
+        note=data.get("note"),
     )
 
 
