@@ -1,5 +1,6 @@
 """同一交通方案多份未确认感知修订候选的并存、比较、选择与撤销。"""
 import json
+import pytest
 
 from scenario_replay import (
     PerceptionWindow,
@@ -16,7 +17,10 @@ from scenario_replay import (
     load_run,
     save_run,
     stage_revision_candidate,
+    stage_joint_revision_candidate,
     undo_revision_selection,
+    withdraw_joint_candidate_source,
+    JointRevisionConflict,
 )
 from tests.test_uncertainty import (
     brake_base_changes,
@@ -266,6 +270,149 @@ def test_pending_candidates_persist_across_save_reload(tmp_path):
     ]
     assert len(injected) == 1
     assert injected[0].tick_ms == 600
+
+
+def test_joint_candidate_merges_shared_window_on_one_timeline_and_collides(tmp_path):
+    engine = _engine()
+    signal = PerceptionWindow(
+        "w-signal", "follower", "signal_red", "j1", 400, 600, 300
+    )
+    brake_a = PerceptionWindow(
+        "w-brake", "follower", "lead_brake", "leader", 400, 700, 500,
+        observed={"observer": "a"},
+    )
+    brake_b = PerceptionWindow(
+        "w-brake", "follower", "lead_brake", "leader", 600, 800, 500,
+        observed={"observer": "b"},
+    )
+    stage_revision_candidate(
+        engine, "observer-a", [signal, brake_a],
+        [WindowConstraint("after", "w-signal", "w-brake")],
+        base_changes=brake_base_changes(), horizon_ms=2500,
+    )
+    stage_revision_candidate(
+        engine, "observer-b", [brake_b],
+        base_changes=brake_base_changes(), horizon_ms=2500,
+    )
+    joint = stage_joint_revision_candidate(
+        engine, "joint-ab", ["observer-a", "observer-b"],
+        horizon_ms=2500,
+    )
+    by_id = {window.window_id: window for window in joint.windows}
+    assert set(by_id) == {"w-signal", "w-brake"}
+    assert (by_id["w-brake"].earliest_ms, by_id["w-brake"].latest_ms) == (600, 700)
+    assert joint.joint_window_sources["w-brake"] == ("observer-a", "observer-b")
+    # 仍未确认：不能派生正式方案，来源候选也仍在待审集合
+    assert "joint-ab" in {c.candidate_id for c in list_revision_candidates(engine)}
+    assert "observer-a" in {c.candidate_id for c in list_revision_candidates(engine)}
+
+    result = derive_revision_candidate(engine, "joint-ab", evaluate_until_ms=2500)
+    assert engine.selected_revision_id == "joint-ab"
+    assert {c.candidate_id for c in list_revision_candidates(engine)} == set()
+    # 每个方案是包含两个窗口的一条联合时间线，而不是拼接单候选运行结果
+    assert sorted(result.schemes[0].assignment) == ["w-brake", "w-signal"]
+    assert result.report is not None
+    assert {evaluation.scheme_id for evaluation in result.report.conflicts}
+    comparisons = compare_revision_candidates([result], until_ms=2500, base_engine=engine)
+    assert comparisons[0].joint_source_ids == ("observer-a", "observer-b")
+    assert comparisons[0].collisions_by_scheme
+
+    path = save_run(engine, tmp_path / "confirmed-joint.json")
+    reopened = load_run(path)
+    assert reopened.selected_revision_id == "joint-ab"
+    repeated = derive_revision_candidate(
+        reopened, "joint-ab", evaluate_until_ms=2500
+    )
+    assert repeated.schemes[0].scheme_id == result.schemes[0].scheme_id
+    assert repeated.revision.joint_candidate_ids == ("observer-a", "observer-b")
+    assert repeated.revision.joint_window_sources["w-brake"] == (
+        "observer-a", "observer-b"
+    )
+
+
+def test_joint_candidate_conflicts_keep_witness_without_dropping_constraints():
+    engine = _engine()
+    windows_a, constraints_a = _two_windows_order("after")
+    windows_b, constraints_b = _two_windows_order("after")
+    stage_revision_candidate(
+        engine, "a", windows_a, constraints_a,
+        base_changes=brake_base_changes(), horizon_ms=2500,
+    )
+    stage_revision_candidate(
+        engine, "b", windows_b,
+        [WindowConstraint("after", "w-brake", "w-signal")],
+        base_changes=brake_base_changes(), horizon_ms=2500,
+    )
+    with pytest.raises(JointRevisionConflict) as exc:
+        stage_joint_revision_candidate(engine, "bad", ["a", "b"])
+    assert exc.value.candidate_ids == ("a", "b")
+    assert set(exc.value.window_ids) == {"w-signal", "w-brake"}
+    assert len(exc.value.constraints) == 2
+    assert "bad" not in {c.candidate_id for c in list_revision_candidates(engine)}
+
+    narrow = PerceptionWindow(
+        "w-signal", "follower", "signal_red", "j1", 600, 700, 300
+    )
+    other = PerceptionWindow(
+        "w-brake", "follower", "lead_brake", "leader", 400, 500, 300
+    )
+    stage_revision_candidate(
+        engine, "no-overlap", [narrow, other],
+        base_changes=brake_base_changes(), horizon_ms=2500,
+    )
+    with pytest.raises(JointRevisionConflict) as exc:
+        stage_joint_revision_candidate(engine, "bad-range", ["a", "no-overlap"])
+    assert exc.value.candidate_ids == ("a", "no-overlap")
+    assert exc.value.window_ids == ("w-signal",)
+
+
+def test_partial_joint_withdrawal_restores_only_unsupported_windows(tmp_path):
+    engine = _engine()
+    signal = PerceptionWindow(
+        "w-signal", "follower", "signal_red", "j1", 400, 600, 300
+    )
+    brake = brake_window(600, 800, 500)
+    pedestrian = PerceptionWindow(
+        "w-pedestrian", "follower", "pedestrian_crossing", "p1", 500, 700, 200
+    )
+    stage_revision_candidate(
+        engine, "main", [signal, brake],
+        base_changes=brake_base_changes(), horizon_ms=2500,
+    )
+    stage_revision_candidate(
+        engine, "extra", [pedestrian],
+        base_changes=brake_base_changes(), horizon_ms=2500,
+    )
+    stage_joint_revision_candidate(
+        engine, "joint", ["main", "extra"], horizon_ms=2500
+    )
+    derive_revision_candidate(engine, "joint", evaluate_until_ms=2500)
+    original_events = [event.event_id for event in engine.scenario.events]
+
+    updated = withdraw_joint_candidate_source(engine, "joint", "extra")
+    assert updated is not None
+    assert updated.review_window_ids == ("w-pedestrian",)
+    assert "extra" in {c.candidate_id for c in list_revision_candidates(engine)}
+    assert "main" not in {c.candidate_id for c in list_revision_candidates(engine)}
+    assert load_revision_candidate(engine, "extra") is not None
+    assert [window.window_id for window in updated.windows] == ["w-signal", "w-brake"]
+    rederived = derive_revision_candidate(
+        engine, "joint", adopt=False, evaluate_until_ms=2500
+    )
+    assert sorted(rederived.schemes[0].assignment) == ["w-brake", "w-signal"]
+    again = derive_revision_candidate(
+        engine, "joint", adopt=False, evaluate_until_ms=2500
+    )
+    assert again.schemes[0].scheme_id == rederived.schemes[0].scheme_id
+
+    path = save_run(engine, tmp_path / "joint-withdraw.json")
+    reopened = load_run(path)
+    reopened_joint = load_revision_candidate(reopened, "joint")
+    assert reopened_joint is not None
+    assert reopened_joint.joint_candidate_ids == ("main",)
+    assert reopened_joint.withdrawn_candidate_ids == ("extra",)
+    assert reopened_joint.review_window_ids == ("w-pedestrian",)
+    assert [event.event_id for event in reopened.scenario.events] == original_events
 
 
 def test_discard_candidate_keeps_others_and_facts():
