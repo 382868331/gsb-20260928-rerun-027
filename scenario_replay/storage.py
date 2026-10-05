@@ -179,6 +179,8 @@ def save_run(engine: ReplayEngine, path: str | Path) -> Path:
             for r in engine.responses
         ],
         "pending_revision": engine.pending_revision,
+        "revision_candidates": dict(engine.revision_candidates),
+        "selected_revision_candidate": engine.selected_revision_candidate,
     }
     path = Path(path)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -291,7 +293,27 @@ def load_run(path: str | Path) -> ReplayEngine:
     engine._handled_perceptions = {p.perception_id for p in engine.perceptions}
     engine._handled_responses = {r.response_id for r in engine.responses}
     pending_revision = payload.get("pending_revision")
-    engine.pending_revision = dict(pending_revision) if pending_revision else None
+    candidates = payload.get("revision_candidates")
+    if candidates:
+        engine.revision_candidates = {
+            str(candidate_id): dict(data)
+            for candidate_id, data in candidates.items()
+        }
+    elif pending_revision:
+        # 旧存档只有单候选：迁移为固定 id 的候选，不丢事实。
+        engine.revision_candidates = {"pending": dict(pending_revision)}
+    engine.selected_revision_candidate = (
+        str(payload["selected_revision_candidate"])
+        if payload.get("selected_revision_candidate") is not None
+        else None
+    )
+    if engine.selected_revision_candidate not in engine.revision_candidates:
+        engine.selected_revision_candidate = None
+    engine.pending_revision = (
+        dict(engine.revision_candidates["pending"])
+        if "pending" in engine.revision_candidates
+        else (dict(pending_revision) if pending_revision else None)
+    )
     return engine
 
 

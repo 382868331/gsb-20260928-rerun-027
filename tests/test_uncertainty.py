@@ -17,11 +17,20 @@ from scenario_replay import (
     derive_schemes,
     enumerate_assignments,
     evaluate_schemes,
+    compare_revision_candidates,
+    confirm_revision_candidate,
+    export_candidate_comparison,
+    list_revision_candidates,
+    load_revision_candidate,
     load_run,
     load_pending_revision,
     rederive_pending_revision,
+    rederive_revision_candidate,
     save_run,
     stage_perception_revision,
+    stage_perception_candidate,
+    undo_revision_selection,
+    selected_revision_candidate,
 )
 
 
@@ -502,3 +511,200 @@ def test_staged_revision_reports_invalid_and_collision_separately_after_reload(t
     assert {evaluation.scheme_id for evaluation in result.report.conflicts} == {"revised-1"}
     assert all(evaluation.collisions for evaluation in result.report.conflicts)
     assert "非碰撞" in result.report.conclusion()
+
+
+def _two_shared_window_candidates(engine):
+    """两份候选共享同一窗口，但采用不同刺激先后约束和反应延迟。"""
+    stop_action = {"type": "set_speed", "speed": 0.0, "rate": 20.0}
+    first = PerceptionWindow(
+        "w1", "follower", "signal_red", "j1", 400, 500, 900,
+        response_action=stop_action,
+    )
+    second = PerceptionWindow(
+        "w2", "follower", "lead_brake", "leader", 400, 500, 900,
+        response_action=stop_action,
+    )
+    late_second = PerceptionWindow(
+        "w2", "follower", "lead_brake", "leader", 500, 700, 500,
+        response_action=stop_action,
+    )
+    stage_perception_candidate(
+        engine,
+        "same-time",
+        [first, second],
+        [WindowConstraint("same", "w1", "w2")],
+        base_changes=brake_base_changes(),
+        horizon_ms=2500,
+    )
+    stage_perception_candidate(
+        engine,
+        "brake-after-signal",
+        [first, late_second],
+        [WindowConstraint("after", "w2", "w1")],
+        base_changes=brake_base_changes(),
+        horizon_ms=2500,
+    )
+    return first, second
+
+
+def test_multiple_candidates_coexist_without_overwriting_each_other(tmp_path):
+    engine = ReplayEngine(uncertain_lead_brake_scenario())
+    first, second = _two_shared_window_candidates(engine)
+
+    assert [candidate.candidate_id for candidate in list_revision_candidates(engine)] == [
+        "brake-after-signal",
+        "same-time",
+    ]
+    # 再暂存第三份候选不影响前两份事实。
+    stage_perception_revision(
+        engine,
+        [brake_window(600, 800, 500)],
+        candidate_id="pending",
+        base_changes=brake_base_changes(),
+        scheme_prefix="legacy",
+        horizon_ms=2500,
+    )
+    same_time = load_revision_candidate(engine, "same-time")
+    assert [window.delay_ms for window in same_time.windows] == [900, 900]
+    assert [constraint.kind for constraint in same_time.constraints] == ["same"]
+
+    comparison = compare_revision_candidates(
+        [
+            load_revision_candidate(engine, "same-time"),
+            load_revision_candidate(engine, "brake-after-signal"),
+        ]
+    )
+    assert comparison.shared_windows == ("w1", "w2")
+    assert any("w2 反应延迟" in text for text in comparison.delay_differences)
+    assert comparison.ordering_differences
+    assert "同刻" in comparison.summary() or "独有" in comparison.summary()
+
+    path = save_run(engine, tmp_path / "candidates.json")
+    reopened = load_run(path)
+    assert [candidate.candidate_id for candidate in list_revision_candidates(reopened)] == [
+        "brake-after-signal",
+        "pending",
+        "same-time",
+    ]
+    assert reopened.pending_revision is not None
+    assert load_pending_revision(reopened).candidate_id == "pending"
+
+
+def test_select_one_candidate_then_undo_and_select_another_keeps_facts(tmp_path):
+    engine = ReplayEngine(uncertain_lead_brake_scenario())
+    _two_shared_window_candidates(engine)
+
+    first_choice = confirm_revision_candidate(engine, "same-time", evaluate_until_ms=2500)
+    assert selected_revision_candidate(engine) == "same-time"
+    first_scheme_ids = [scheme.scheme_id for scheme in first_choice.schemes]
+    first_event_ids = [
+        record.event_id
+        for scheme in first_choice.schemes
+        for record in scheme.engine.journal
+        if record.action.get("type") == "inject_perception"
+    ]
+
+    # 重复确认同一候选幂等：事件身份不变，两份其它候选与原方案仍保留。
+    repeated = confirm_revision_candidate(engine, "same-time", evaluate_until_ms=2500)
+    assert [scheme.scheme_id for scheme in repeated.schemes] == first_scheme_ids
+    assert selected_revision_candidate(engine) == "same-time"
+    assert {candidate.candidate_id for candidate in list_revision_candidates(engine)} == {
+        "same-time",
+        "brake-after-signal",
+    }
+
+    undone = undo_revision_selection(engine)
+    assert undone == "same-time"
+    assert selected_revision_candidate(engine) is None
+    other = confirm_revision_candidate(
+        engine, "brake-after-signal", evaluate_until_ms=2500
+    )
+    assert selected_revision_candidate(engine) == "brake-after-signal"
+    other_event_ids = [
+        record.event_id
+        for scheme in other.schemes
+        for record in scheme.engine.journal
+        if record.action.get("type") == "inject_perception"
+    ]
+    # 两次选择的事件身份使用各自稳定前缀；改选不借用先选候选的事件。
+    assert not set(first_event_ids) & set(other_event_ids)
+    assert all(event_id.startswith("brake-after-signal") for event_id in other_event_ids)
+    # 首次分歧仍可追溯：同刻候选只派生同刻组合，先后候选只派生合法先后组合。
+    assert len(first_choice.constraint_violations) == 2
+    assert len(other.constraint_violations) == 5
+    assert len(other.schemes) == 1
+
+    path = save_run(engine, tmp_path / "selected.json")
+    reopened = load_run(path)
+    assert selected_revision_candidate(reopened) == "brake-after-signal"
+    assert undo_revision_selection(reopened) == "brake-after-signal"
+    assert selected_revision_candidate(reopened) is None
+
+
+def test_candidate_comparison_export_separates_exclusion_collision_explored_unverified():
+    engine = ReplayEngine(uncertain_lead_brake_scenario())
+    _two_shared_window_candidates(engine)
+
+    # 不给定时域：可以比较输入，但碰撞/已探索/未验证范围明确标为尚未评估。
+    pending = export_candidate_comparison(engine)
+    pending_data = pending.export()
+    assert pending_data["candidate_ids"] == ["brake-after-signal", "same-time"]
+    assert all(
+        candidate["actual_collisions"] == []
+        and candidate["explored_discrete_assignments"] == 0
+        and candidate["unexplored_assignments"] is None
+        for candidate in pending_data["candidates"]
+    )
+    assert "尚未重放评估" in pending.narrative()
+
+    report = export_candidate_comparison(engine, evaluate_until_ms=2500)
+    data = report.export()
+    by_id = {candidate["candidate_id"]: candidate for candidate in data["candidates"]}
+    same_time = by_id["same-time"]
+    brake_after = by_id["brake-after-signal"]
+    # 约束排除不是实际碰撞：同刻候选排除 2 个组合，碰撞方案另行计数。
+    assert len(same_time["constraint_excluded"]) == 2
+    assert same_time["explored_discrete_assignments"] == 2
+    assert same_time["unexplored_assignments"] == 0
+    assert {
+        collision["scheme_id"]
+        for collision in same_time["actual_collisions"]
+    } == {"same-time-1"}
+    assert len(brake_after["constraint_excluded"]) == 5
+    assert brake_after["explored_discrete_assignments"] == 1
+    assert brake_after["unexplored_assignments"] == 0
+    assert brake_after["actual_collisions"] == []
+    narrative = report.narrative()
+    assert "约束排除 2 个离散组合（未派生、非实际碰撞）" in narrative
+    assert "实际碰撞方案" in narrative
+    assert "未验证组合" in narrative
+    # 导出不改变选择状态、不删除候选。
+    assert selected_revision_candidate(engine) is None
+    assert len(list_revision_candidates(engine)) == 2
+
+
+def test_rederive_candidate_is_idempotent_and_does_not_touch_other_candidates():
+    engine = ReplayEngine(uncertain_lead_brake_scenario())
+    stage_perception_candidate(
+        engine,
+        "a",
+        [brake_window(400, 500, 500)],
+        base_changes=brake_base_changes(),
+        horizon_ms=2500,
+    )
+    stage_perception_candidate(
+        engine,
+        "b",
+        [brake_window(700, 800, 500)],
+        base_changes=brake_base_changes(),
+        horizon_ms=2500,
+    )
+    first = rederive_revision_candidate(engine, "a", evaluate_until_ms=2500)
+    second = rederive_revision_candidate(engine, "a", evaluate_until_ms=2500)
+    assert [scheme.scheme_id for scheme in first.schemes] == [
+        scheme.scheme_id for scheme in second.schemes
+    ]
+    assert selected_revision_candidate(engine) is None
+    candidate_b = load_revision_candidate(engine, "b")
+    assert [window.earliest_ms for window in candidate_b.windows] == [700]
+    assert candidate_b.candidate_id == "b"

@@ -139,8 +139,13 @@ class ReplayEngine:
         self._handled_responses: set[str] = set()
         self._collision_pairs: set[Tuple[str, str]] = set()
         self.paused = False
-        # 已保存但尚未由用户确认重派生的输入修订。
+        # 已保存但尚未由用户确认重派生的输入修订（可同时存在多份候选）。
         # 这里只保存不透明数据；重派生前不得改变场景事件或反应参数。
+        # candidate_id -> revision dict；选择/再确认/撤销只改选择标记，
+        # 不覆盖、不删除任何候选与原方案事实。
+        self.revision_candidates: Dict[str, dict] = {}
+        self.selected_revision_candidate: Optional[str] = None
+        # 向后兼容：单候选旧接口固定使用 "pending" 这个候选 id。
         self.pending_revision: Optional[dict] = None
 
     # ---- 基础查询 ----

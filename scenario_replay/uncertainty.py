@@ -187,14 +187,234 @@ class PerceptionRevision:
     horizon_ms: Optional[int] = None
     created_at_ms: Optional[int] = None
     reason: Optional[str] = None
+    candidate_id: str = "pending"
 
 
 @dataclass(frozen=True)
 class RevisionResult:
     revision: PerceptionRevision
+    candidate_id: str
     schemes: Tuple[DerivedScheme, ...]
     constraint_violations: Tuple[ConstraintViolation, ...]
     report: Optional[UncertaintyReport]
+
+
+@dataclass(frozen=True)
+class CandidateScope:
+    """一个候选覆盖的观测范围与刺激先后信息（用于候选间对比）。"""
+
+    candidate_id: str
+    windows: Tuple[PerceptionWindow, ...]
+    constraints: Tuple[WindowConstraint, ...]
+
+    @property
+    def window_ids(self) -> Tuple[str, ...]:
+        return tuple(window.window_id for window in self.windows)
+
+    def covers(self, window_id: str) -> bool:
+        return window_id in self.window_ids
+
+    def overlaps(self, other: "CandidateScope") -> Tuple[str, ...]:
+        """两个候选共享的观测窗口 id。"""
+        return tuple(
+            window_id
+            for window_id in self.window_ids
+            if window_id in set(other.window_ids)
+        )
+
+    def ordering_pairs(self) -> Tuple[Tuple[str, str, str], ...]:
+        """约束要求的刺激先后/同刻：(kind, first, second)。"""
+        return tuple(
+            (constraint.kind, constraint.first_id, constraint.second_id)
+            for constraint in self.constraints
+        )
+
+
+@dataclass(frozen=True)
+class WindowObservationImpact:
+    """单个观测窗口在一个候选中的观测范围、顺序位置与反应延迟。"""
+
+    window_id: str
+    vehicle_id: str
+    stimulus: str
+    source_id: str
+    earliest_ms: int
+    latest_ms: int
+    delay_ms: int
+    order_constraints: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CandidateComparison:
+    """多份未确认候选的并排比较（不做派生、不改变任何候选）。"""
+
+    candidate_ids: Tuple[str, ...]
+    shared_windows: Tuple[str, ...]
+    scopes: Tuple[CandidateScope, ...]
+    observations: Dict[str, Tuple[WindowObservationImpact, ...]]
+    observation_differences: Tuple[str, ...]
+    ordering_differences: Tuple[str, ...]
+    delay_differences: Tuple[str, ...]
+    scope_differences: Tuple[str, ...]
+
+    def summary(self) -> str:
+        parts = [f"候选 {len(self.candidate_ids)} 份：{', '.join(self.candidate_ids)}"]
+        if self.shared_windows:
+            parts.append(f"共享观测窗口 {', '.join(self.shared_windows)}")
+        for label, differences in (
+            ("观测范围差异", self.observation_differences),
+            ("刺激先后约束差异", self.ordering_differences),
+            ("反应延迟差异", self.delay_differences),
+            ("窗口集合差异", self.scope_differences),
+        ):
+            if differences:
+                parts.append(f"{label}：" + "；".join(differences))
+        return "；".join(parts) + "。"
+
+
+@dataclass(frozen=True)
+class CandidateEvaluation:
+    """一份候选派生后的离散对照结果。"""
+
+    candidate_id: str
+    result: RevisionResult
+
+
+@dataclass(frozen=True)
+class CandidateComparisonReport:
+    """候选比较导出：约束排除、实际碰撞、已探索组合、未验证范围分开说明。"""
+
+    candidate_ids: Tuple[str, ...]
+    selected_candidate_id: Optional[str]
+    comparisons: Tuple[CandidateEvaluation, ...]
+    candidate_comparison: CandidateComparison
+    horizon_ms: Optional[int]
+
+    def export(self) -> Dict[str, Any]:
+        return {
+            "candidate_ids": list(self.candidate_ids),
+            "selected_candidate_id": self.selected_candidate_id,
+            "shared_windows": list(self.candidate_comparison.shared_windows),
+            "observation_differences": list(
+                self.candidate_comparison.observation_differences
+            ),
+            "ordering_differences": list(
+                self.candidate_comparison.ordering_differences
+            ),
+            "delay_differences": list(self.candidate_comparison.delay_differences),
+            "scope_differences": list(self.candidate_comparison.scope_differences),
+            "candidates": [
+                {
+                    "candidate_id": comparison.candidate_id,
+                    "constraint_excluded": [
+                        {
+                            "assignment": [list(item) for item in violation.assignment],
+                            "violated_constraints": [
+                                {
+                                    "kind": constraint.kind,
+                                    "first_id": constraint.first_id,
+                                    "second_id": constraint.second_id,
+                                }
+                                for constraint in violation.violated_constraints
+                            ],
+                            "reason": violation.reason,
+                        }
+                        for violation in comparison.result.constraint_violations
+                    ],
+                    "actual_collisions": [
+                        {
+                            "scheme_id": evaluation.scheme_id,
+                            "assignment": [list(item) for item in evaluation.assignment],
+                            "collisions": [
+                                {
+                                    "tick_ms": collision.tick_ms,
+                                    "actor_a": collision.actor_a,
+                                    "actor_b": collision.actor_b,
+                                    "reason": collision.reason,
+                                }
+                                for collision in evaluation.collisions
+                            ],
+                        }
+                        for evaluation in (
+                            comparison.result.report.evaluations
+                            if comparison.result.report is not None
+                            else ()
+                        )
+                        if evaluation.collisions
+                    ],
+                    "explored_discrete_assignments": (
+                        comparison.result.report.explored_count
+                        if comparison.result.report is not None
+                        else 0
+                    ),
+                    "unexplored_assignments": (
+                        comparison.result.report.unexplored_count
+                        if comparison.result.report is not None
+                        else None
+                    ),
+                    "unverified_ranges": _unverified_windows(comparison.result),
+                    "conclusion": (
+                        comparison.result.report.conclusion()
+                        if comparison.result.report is not None
+                        else None
+                    ),
+                }
+                for comparison in self.comparisons
+            ],
+        }
+
+    def narrative(self) -> str:
+        """人工可核对的文字导出；四类结果分别说明，不把约束排除算成碰撞。"""
+        lines = [
+            f"候选：{', '.join(self.candidate_ids)}"
+            + (
+                f"；已选择 {self.selected_candidate_id}"
+                if self.selected_candidate_id is not None
+                else "；尚无选择"
+            )
+        ]
+        lines.append(self.candidate_comparison.summary())
+        for comparison in self.comparisons:
+            result = comparison.result
+            report = result.report
+            segment = [f"候选 {comparison.candidate_id}："]
+            segment.append(
+                f"约束排除 {len(result.constraint_violations)} 个离散组合（未派生、非实际碰撞）"
+            )
+            if report is None:
+                segment.append("实际碰撞/已探索组合/未验证范围：未给定时域，尚未重放评估")
+            else:
+                actual = sum(
+                    1 for evaluation in report.evaluations if evaluation.collisions
+                )
+                segment.append(
+                    f"实际碰撞方案 {actual} 个，"
+                    f"已探索离散组合 {report.explored_count} 个，"
+                    f"未验证组合 {report.unexplored_count} 个"
+                )
+                unverified = _unverified_windows(result)
+                if unverified:
+                    segment.append(
+                        "未验证范围：" + "，".join(unverified)
+                    )
+                segment.append(report.conclusion())
+            lines.append("".join(segment))
+        return "\n".join(lines)
+
+
+def _unverified_windows(result: RevisionResult) -> Tuple[str, ...]:
+    report = result.report
+    if report is None:
+        return tuple(
+            f"{window.window_id}[{window.earliest_ms},{window.latest_ms}]"
+            for window in result.revision.windows
+        )
+    if report.covers_full_range:
+        return ()
+    return tuple(
+        f"{window.window_id}[{window.earliest_ms},{window.latest_ms}]"
+        for window in result.revision.windows
+    )
 
 
 def window_ticks(window: PerceptionWindow, tick_ms: int) -> Tuple[int, ...]:
@@ -382,18 +602,28 @@ def stage_perception_revision(
     windows: Sequence[PerceptionWindow],
     constraints: Sequence[WindowConstraint] = (),
     *,
+    candidate_id: str = "pending",
     at_ms: Optional[int] = None,
     base_changes: Optional[BranchChanges] = None,
     scheme_prefix: str = "revised",
     horizon_ms: Optional[int] = None,
     reason: Optional[str] = None,
 ) -> PerceptionRevision:
-    """暂存修订；保存/重开后仍需用户显式调用重派生。"""
+    """暂存修订；保存/重开后仍需用户显式调用重派生。
+
+    同一交通方案可同时暂存多份候选；每份候选用 candidate_id 区分，
+    最后编辑的一份不会覆盖先前候选或原方案事实。
+    """
     windows = tuple(windows)
     constraints = tuple(constraints)
     tick_ms = engine.scenario.tick_ms
     for window in windows:
         window_ticks(window, tick_ms)
+    if not candidate_id:
+        raise ValueError("candidate_id must be a non-empty string")
+    if candidate_id in engine.revision_candidates:
+        raise ValueError(f"revision candidate already exists: {candidate_id!r}")
+    _validate_scheme_prefix_unique(engine, scheme_prefix, candidate_id)
     for constraint in constraints:
         ids = {window.window_id for window in windows}
         if constraint.first_id not in ids or constraint.second_id not in ids:
@@ -402,6 +632,7 @@ def stage_perception_revision(
             raise ValueError(f"unknown constraint kind: {constraint.kind!r}")
 
     revision = PerceptionRevision(
+        candidate_id=candidate_id,
         windows=windows,
         constraints=constraints,
         base_scenario=scenario_to_dict(_revision_base_scenario(engine)),
@@ -412,14 +643,72 @@ def stage_perception_revision(
         created_at_ms=engine.now_ms,
         reason=reason,
     )
-    engine.pending_revision = revision_to_dict(revision)
+    _store_candidate(engine, revision)
     return revision
 
 
 def load_pending_revision(engine: ReplayEngine) -> Optional[PerceptionRevision]:
-    if not engine.pending_revision:
-        return None
-    return revision_from_dict(engine.pending_revision)
+    """向后兼容：返回固定候选 "pending"，不存在时返回 None。"""
+    return load_revision_candidate(engine, "pending")
+
+
+def stage_perception_candidate(
+    engine: ReplayEngine,
+    candidate_id: str,
+    windows: Sequence[PerceptionWindow],
+    constraints: Sequence[WindowConstraint] = (),
+    *,
+    at_ms: Optional[int] = None,
+    base_changes: Optional[BranchChanges] = None,
+    scheme_prefix: Optional[str] = None,
+    horizon_ms: Optional[int] = None,
+    reason: Optional[str] = None,
+) -> PerceptionRevision:
+    """暂存一份命名的未确认候选；与已有候选并存、互不覆盖。"""
+    return stage_perception_revision(
+        engine,
+        windows,
+        constraints,
+        candidate_id=candidate_id,
+        at_ms=at_ms,
+        base_changes=base_changes,
+        scheme_prefix=scheme_prefix if scheme_prefix is not None else candidate_id,
+        horizon_ms=horizon_ms,
+        reason=reason,
+    )
+
+
+def list_revision_candidates(engine: ReplayEngine) -> Tuple[PerceptionRevision, ...]:
+    """返回全部未确认候选（含已选择但可撤销的候选，均不删除）。"""
+    return tuple(
+        revision_from_dict(engine.revision_candidates[candidate_id])
+        for candidate_id in sorted(engine.revision_candidates)
+    )
+
+
+def load_revision_candidate(
+    engine: ReplayEngine, candidate_id: str
+) -> Optional[PerceptionRevision]:
+    """读取一份候选；候选保留原样，读取不产生任何副作用。"""
+    data = engine.revision_candidates.get(candidate_id)
+    return revision_from_dict(data) if data else None
+
+
+def _store_candidate(engine: ReplayEngine, revision: PerceptionRevision) -> None:
+    engine.revision_candidates[revision.candidate_id] = revision_to_dict(revision)
+    if revision.candidate_id == "pending":
+        engine.pending_revision = engine.revision_candidates["pending"]
+
+
+def _validate_scheme_prefix_unique(
+    engine: ReplayEngine, scheme_prefix: str, candidate_id: str
+) -> None:
+    for existing_id, data in engine.revision_candidates.items():
+        if existing_id != candidate_id and data.get("scheme_prefix") == scheme_prefix:
+            raise ValueError(
+                f"scheme_prefix {scheme_prefix!r} 已被候选 {existing_id!r} 使用；"
+                "派生事件身份必须在候选间唯一"
+            )
 
 
 def rederive_pending_revision(
@@ -432,6 +721,91 @@ def rederive_pending_revision(
     stored = load_pending_revision(engine)
     if stored is None:
         raise ValueError("no pending perception revision")
+    result = _rederive_revision(stored)
+    horizon = (
+        evaluate_until_ms if evaluate_until_ms is not None else stored.horizon_ms
+    )
+    if horizon is not None:
+        result = _evaluate_revision_result(result, horizon)
+    if adopt:
+        # 旧单候选语义：采用后移除该候选。多候选流程请用 select_revision_candidate。
+        _discard_candidate(engine, "pending")
+    return result
+
+
+def rederive_revision_candidate(
+    engine: ReplayEngine,
+    candidate_id: str,
+    *,
+    evaluate_until_ms: Optional[int] = None,
+) -> RevisionResult:
+    """派生一份未确认候选；不选择、不覆盖任何其它候选与原方案事实。
+
+    重复派生同一候选是幂等的：返回的方案使用相同 scheme id 与事件身份。
+    """
+    stored = load_revision_candidate(engine, candidate_id)
+    if stored is None:
+        raise ValueError(f"unknown revision candidate: {candidate_id!r}")
+    result = _rederive_revision(stored)
+    horizon = (
+        evaluate_until_ms if evaluate_until_ms is not None else stored.horizon_ms
+    )
+    if horizon is not None:
+        result = _evaluate_revision_result(result, horizon)
+    return result
+
+
+def confirm_revision_candidate(
+    engine: ReplayEngine,
+    candidate_id: str,
+    *,
+    evaluate_until_ms: Optional[int] = None,
+) -> RevisionResult:
+    """选择一份候选派生为当前确认修订；其它候选与原方案事实全部保留。
+
+    重复确认同一候选幂等：只重放派生，不覆盖先前候选，事件身份保持不变。
+    """
+    if load_revision_candidate(engine, candidate_id) is None:
+        raise ValueError(f"unknown revision candidate: {candidate_id!r}")
+    result = rederive_revision_candidate(
+        engine, candidate_id, evaluate_until_ms=evaluate_until_ms
+    )
+    engine.selected_revision_candidate = candidate_id
+    return result
+
+
+# 向后兼容别名。
+select_revision_candidate = confirm_revision_candidate
+
+
+def undo_revision_selection(
+    engine: ReplayEngine,
+    *,
+    candidate_id: Optional[str] = None,
+) -> Optional[str]:
+    """撤销一次选择；候选与原方案事实保留，可改选另一份。"""
+    previous = engine.selected_revision_candidate
+    if candidate_id is not None and previous != candidate_id:
+        raise ValueError(
+            f"selected candidate is {previous!r}, cannot undo {candidate_id!r}"
+        )
+    engine.selected_revision_candidate = None
+    return previous
+
+
+def selected_revision_candidate(engine: ReplayEngine) -> Optional[str]:
+    return engine.selected_revision_candidate
+
+
+def _discard_candidate(engine: ReplayEngine, candidate_id: str) -> None:
+    engine.revision_candidates.pop(candidate_id, None)
+    if candidate_id == "pending":
+        engine.pending_revision = None
+    if engine.selected_revision_candidate == candidate_id:
+        engine.selected_revision_candidate = None
+
+
+def _rederive_revision(stored: PerceptionRevision) -> RevisionResult:
     if stored.base_scenario is None:
         raise ValueError("pending revision does not contain a replayable base scenario")
 
@@ -459,23 +833,32 @@ def rederive_pending_revision(
         stored.windows, stored.constraints, tick_ms
     )
     total = len(assignments) + len(violations)
-    horizon = evaluate_until_ms if evaluate_until_ms is not None else stored.horizon_ms
-    report = (
-        evaluate_schemes(
-            schemes,
-            horizon,
-            total_assignments=total,
-            constraint_violations_found=violations,
-        )
-        if horizon is not None
-        else None
-    )
-    if adopt:
-        engine.pending_revision = None
     return RevisionResult(
         revision=stored,
+        candidate_id=stored.candidate_id,
         schemes=schemes,
         constraint_violations=violations,
+        report=None,
+    )
+
+
+def _evaluate_revision_result(
+    result: RevisionResult, horizon: int
+) -> RevisionResult:
+    stored = result.revision
+    report = evaluate_schemes(
+        result.schemes,
+        horizon,
+        total_assignments=(
+            len(result.schemes) + len(result.constraint_violations)
+        ),
+        constraint_violations_found=result.constraint_violations,
+    )
+    return RevisionResult(
+        revision=stored,
+        candidate_id=result.candidate_id,
+        schemes=result.schemes,
+        constraint_violations=result.constraint_violations,
         report=report,
     )
 
@@ -579,6 +962,7 @@ def branch_changes_from_dict(data: Mapping[str, Any]) -> BranchChanges:
 
 def revision_to_dict(revision: PerceptionRevision) -> Dict[str, Any]:
     return {
+        "candidate_id": revision.candidate_id,
         "windows": [
             {
                 "window_id": window.window_id,
@@ -617,6 +1001,7 @@ def revision_to_dict(revision: PerceptionRevision) -> Dict[str, Any]:
 
 def revision_from_dict(data: Mapping[str, Any]) -> PerceptionRevision:
     return PerceptionRevision(
+        candidate_id=data.get("candidate_id", "pending"),
         windows=tuple(
             PerceptionWindow(
                 window_id=window["window_id"],
@@ -933,3 +1318,230 @@ def _observed_without_scheme_fields(observed: Mapping[str, object]) -> Dict[str,
         for key, value in observed.items()
         if key not in {"window_id", "injected", "delay_ms"}
     }
+
+
+def compare_revision_candidates(
+    candidates: Sequence[PerceptionRevision],
+) -> CandidateComparison:
+    """比较多份未确认候选影响的观测范围、刺激顺序与反应延迟。
+
+    纯读取：不派生、不修改候选或原方案事实。
+    """
+    candidates = tuple(candidates)
+    if len({candidate.candidate_id for candidate in candidates}) != len(candidates):
+        raise ValueError("duplicate revision candidate ids")
+    if not candidates:
+        raise ValueError("at least one revision candidate is required")
+    scopes = tuple(
+        CandidateScope(
+            candidate_id=candidate.candidate_id,
+            windows=candidate.windows,
+            constraints=candidate.constraints,
+        )
+        for candidate in candidates
+    )
+    first = scopes[0]
+    shared = set(first.window_ids)
+    for scope in scopes[1:]:
+        shared &= set(scope.window_ids)
+    observations = {
+        candidate.candidate_id: _observation_impacts(candidate)
+        for candidate in candidates
+    }
+    return CandidateComparison(
+        candidate_ids=tuple(candidate.candidate_id for candidate in candidates),
+        shared_windows=tuple(
+            window_id for window_id in first.window_ids if window_id in shared
+        ),
+        scopes=scopes,
+        observations=observations,
+        observation_differences=_observation_range_differences(scopes),
+        ordering_differences=_ordering_differences(scopes),
+        delay_differences=_delay_differences(observations, tuple(shared)),
+        scope_differences=_scope_differences(scopes, tuple(shared)),
+    )
+
+
+def export_candidate_comparison(
+    engine: ReplayEngine,
+    candidate_ids: Optional[Sequence[str]] = None,
+    *,
+    evaluate_until_ms: Optional[int] = None,
+) -> CandidateComparisonReport:
+    """导出候选比较：约束排除、实际碰撞、已探索组合、未验证范围分开。
+
+    派生只从各候选自带的原方案快照重建，不改动当前引擎、不覆盖任何候选；
+    重复导出同一候选使用相同 scheme/事件身份，便于回跳核对。
+    """
+    ids = (
+        tuple(candidate_ids)
+        if candidate_ids is not None
+        else tuple(sorted(engine.revision_candidates))
+    )
+    if not ids:
+        raise ValueError("no revision candidates to compare")
+    revisions = []
+    for candidate_id in ids:
+        revision = load_revision_candidate(engine, candidate_id)
+        if revision is None:
+            raise ValueError(f"unknown revision candidate: {candidate_id!r}")
+        revisions.append(revision)
+    comparisons = tuple(
+        CandidateEvaluation(
+            candidate_id=revision.candidate_id,
+            result=(lambda result: (
+                result
+                if (
+                    evaluate_until_ms is None
+                    or (revision.horizon_ms is None and evaluate_until_ms is None)
+                )
+                else _evaluate_revision_result(
+                    result,
+                    evaluate_until_ms
+                    if evaluate_until_ms is not None
+                    else revision.horizon_ms,
+                )
+            ))(_rederive_revision(revision)),
+        )
+        for revision in revisions
+    )
+    horizon_values = {
+        comparison.result.report.horizon_ms
+        for comparison in comparisons
+        if comparison.result.report is not None
+    }
+    return CandidateComparisonReport(
+        candidate_ids=tuple(ids),
+        selected_candidate_id=engine.selected_revision_candidate,
+        comparisons=comparisons,
+        candidate_comparison=compare_revision_candidates(revisions),
+        horizon_ms=next(iter(horizon_values)) if len(horizon_values) == 1 else None,
+    )
+
+
+def _observation_impacts(
+    candidate: PerceptionRevision,
+) -> Tuple[WindowObservationImpact, ...]:
+    after: Dict[str, List[str]] = {}
+    same: Dict[str, List[str]] = {}
+    for constraint in candidate.constraints:
+        if constraint.kind == "after":
+            after.setdefault(constraint.second_id, []).append(
+                f"after:{constraint.first_id}"
+            )
+        elif constraint.kind == "same":
+            same.setdefault(constraint.second_id, []).append(
+                f"same:{constraint.first_id}"
+            )
+    return tuple(
+        WindowObservationImpact(
+            window_id=window.window_id,
+            vehicle_id=window.vehicle_id,
+            stimulus=window.stimulus,
+            source_id=window.source_id,
+            earliest_ms=window.earliest_ms,
+            latest_ms=window.latest_ms,
+            delay_ms=window.delay_ms,
+            order_constraints=tuple(
+                after.get(window.window_id, []) + same.get(window.window_id, [])
+            ),
+        )
+        for window in candidate.windows
+    )
+
+
+def _observation_range_differences(
+    scopes: Sequence[CandidateScope],
+) -> Tuple[str, ...]:
+    all_ids = sorted({window_id for scope in scopes for window_id in scope.window_ids})
+    by_candidate = {
+        scope.candidate_id: {window.window_id: window for window in scope.windows}
+        for scope in scopes
+    }
+    differences: List[str] = []
+    for window_id in all_ids:
+        present = [
+            (candidate_id, by_candidate[candidate_id][window_id])
+            for candidate_id in by_candidate
+            if window_id in by_candidate[candidate_id]
+        ]
+        if len(present) != len(scopes):
+            missing = [
+                candidate_id
+                for candidate_id in by_candidate
+                if window_id not in by_candidate[candidate_id]
+            ]
+            present_ids = [candidate_id for candidate_id, _ in present]
+            differences.append(
+                f"{window_id} 仅在 {present_ids} 中，"
+                f"缺失于 {missing}"
+            )
+            continue
+        ranges = {
+            candidate_id: (window.earliest_ms, window.latest_ms)
+            for candidate_id, window in present
+        }
+        if len(set(ranges.values())) > 1:
+            differences.append(
+                f"{window_id} 观测范围 "
+                + "，".join(
+                    f"{candidate_id}:[{start},{end}]"
+                    for candidate_id, (start, end) in ranges.items()
+                )
+            )
+    return tuple(differences)
+
+
+def _ordering_differences(scopes: Sequence[CandidateScope]) -> Tuple[str, ...]:
+    baseline = scopes[0].ordering_pairs()
+    differences: List[str] = []
+    for scope in scopes[1:]:
+        pairs = scope.ordering_pairs()
+        only_base = sorted(set(baseline) - set(pairs))
+        only_scope = sorted(set(pairs) - set(baseline))
+        if only_base or only_scope:
+            parts = [f"{scopes[0].candidate_id} 独有 {only_base}"]
+            parts.append(f"{scope.candidate_id} 独有 {only_scope}")
+            differences.append("；".join(parts))
+    return tuple(differences)
+
+
+def _delay_differences(
+    observations: Mapping[str, Tuple[WindowObservationImpact, ...]],
+    shared_windows: Tuple[str, ...],
+) -> Tuple[str, ...]:
+    differences: List[str] = []
+    candidate_items = list(observations.items())
+    for window_id in shared_windows:
+        delays = {
+            candidate_id: next(
+                item.delay_ms
+                for item in items
+                if item.window_id == window_id
+            )
+            for candidate_id, items in candidate_items
+        }
+        if len(set(delays.values())) > 1:
+            differences.append(
+                f"{window_id} 反应延迟 "
+                + "，".join(
+                    f"{candidate_id}:{delay}ms"
+                    for candidate_id, delay in delays.items()
+                )
+            )
+    return tuple(differences)
+
+
+def _scope_differences(
+    scopes: Sequence[CandidateScope], shared_windows: Tuple[str, ...]
+) -> Tuple[str, ...]:
+    differences: List[str] = []
+    for scope in scopes:
+        unique = [
+            window_id
+            for window_id in scope.window_ids
+            if window_id not in shared_windows
+        ]
+        if unique:
+            differences.append(f"{scope.candidate_id} 独有窗口 {unique}")
+    return tuple(differences)
