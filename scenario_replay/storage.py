@@ -183,6 +183,10 @@ def save_run(engine: ReplayEngine, path: str | Path) -> Path:
         "selected_revision_id": engine.selected_revision_id,
         "revision_selection_history": list(engine.revision_selection_history),
         "adopted_revisions": dict(engine.adopted_revisions),
+        "pending_joint_proposals": dict(engine.pending_joint_proposals),
+        "adopted_joint_proposals": dict(engine.adopted_joint_proposals),
+        "selected_joint_proposal_id": engine.selected_joint_proposal_id,
+        "joint_selection_history": list(engine.joint_selection_history),
     }
     path = Path(path)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -308,6 +312,24 @@ def load_run(path: str | Path) -> ReplayEngine:
         str(candidate_id): dict(data)
         for candidate_id, data in (payload.get("adopted_revisions") or {}).items()
     }
+    engine.pending_joint_proposals = {
+        str(proposal_id): dict(data)
+        for proposal_id, data in (
+            payload.get("pending_joint_proposals") or {}
+        ).items()
+    }
+    engine.adopted_joint_proposals = {
+        str(proposal_id): dict(data)
+        for proposal_id, data in (
+            payload.get("adopted_joint_proposals") or {}
+        ).items()
+    }
+    engine.selected_joint_proposal_id = payload.get(
+        "selected_joint_proposal_id"
+    )
+    engine.joint_selection_history = list(
+        payload.get("joint_selection_history") or []
+    )
     return engine
 
 

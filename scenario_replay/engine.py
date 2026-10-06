@@ -151,6 +151,11 @@ class ReplayEngine:
         # 已派生确认的候选修订数据：撤销选择时据此把候选退回未决集合，
         # 原方案事实与其他候选不受影响。
         self.adopted_revisions: Dict[str, dict] = {}
+        # 多候选组成的联合解释。联合提案在确认前不得派生交通方案。
+        self.pending_joint_proposals: Dict[str, dict] = {}
+        self.adopted_joint_proposals: Dict[str, dict] = {}
+        self.selected_joint_proposal_id: Optional[str] = None
+        self.joint_selection_history: List[Optional[str]] = []
 
     # ---- 基础查询 ----
 

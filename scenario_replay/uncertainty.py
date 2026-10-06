@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import product
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -53,6 +53,7 @@ class WindowConstraint:
     kind: str
     first_id: str
     second_id: str
+    source_candidate_ids: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -214,6 +215,7 @@ class WindowImpact:
     latest_ms: int
     tick_choices: int
     delay_ms: int
+    source_candidate_ids: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -237,6 +239,54 @@ class CandidateComparison:
     first_divergence_scheme_id: Optional[str]
     fact_divergence_from_base: Optional[Divergence]
     fact_divergence_scheme_id: Optional[str]
+    source_proposal_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class JointConflict:
+    """阻止联合解释成立的证据；不得通过删除其中约束来回避。"""
+
+    kind: str  # shared_window_range / shared_window_delay / constraint_cycle / unsupported_constraint / base_change
+    candidate_ids: Tuple[str, ...]
+    window_ids: Tuple[str, ...] = ()
+    constraints: Tuple[WindowConstraint, ...] = ()
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class JointProposal:
+    """多份候选中选出的窗口组成的未确认联合解释。"""
+
+    proposal_id: str
+    candidate_ids: Tuple[str, ...]
+    windows: Tuple[PerceptionWindow, ...]
+    constraints: Tuple[WindowConstraint, ...]
+    window_sources: Tuple[Tuple[str, Tuple[str, ...]], ...]
+    base_scenario: Optional[Mapping[str, Any]]
+    base_changes: Optional[Mapping[str, Any]] = None
+    at_ms: Optional[int] = None
+    horizon_ms: Optional[int] = None
+    created_at_ms: Optional[int] = None
+    reason: Optional[str] = None
+    conflicts: Tuple[JointConflict, ...] = ()
+    withdrawn_candidate_ids: Tuple[str, ...] = ()
+    restored_window_ids: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class JointRevisionResult:
+    proposal: JointProposal
+    schemes: Tuple[DerivedScheme, ...]
+    constraint_violations: Tuple[ConstraintViolation, ...]
+    report: Optional[UncertaintyReport]
+
+
+class JointProposalIncompatible(ValueError):
+    """联合提案存在冲突；调用方必须展示冲突，不能静默删约束。"""
+
+    def __init__(self, proposal: JointProposal):
+        super().__init__("; ".join(conflict.message for conflict in proposal.conflicts))
+        self.proposal = proposal
 
 
 def window_ticks(window: PerceptionWindow, tick_ms: int) -> Tuple[int, ...]:
@@ -542,6 +592,326 @@ def discard_revision_candidate(engine: ReplayEngine, candidate_id: str) -> None:
     )
 
 
+def stage_joint_proposal(
+    engine: ReplayEngine,
+    proposal_id: str,
+    candidate_ids: Sequence[str],
+    *,
+    selected_window_ids: Optional[Mapping[str, Sequence[str]]] = None,
+    joint_constraints: Sequence[WindowConstraint] = (),
+    horizon_ms: Optional[int] = None,
+    reason: Optional[str] = None,
+) -> JointProposal:
+    """从多份未确认候选选择窗口，组成一个仍待确认的联合解释。
+
+    该函数只检查并暂存，不派生方案、不改变任何交通事件。若只选取候选的
+    部分窗口，仍被该候选声明的跨窗口约束不能静默丢弃；端点未入选时作为
+    联合冲突记录。
+    """
+    if not proposal_id:
+        raise ValueError("proposal_id must be a non-empty string")
+    ids = tuple(candidate_ids)
+    if len(ids) < 2:
+        raise ValueError("joint proposal requires at least two candidates")
+    if len(set(ids)) != len(ids):
+        raise ValueError("candidate_ids must be unique")
+    revisions: Dict[str, PerceptionRevision] = {}
+    for candidate_id in ids:
+        data = engine.pending_revisions.get(candidate_id)
+        if data is None:
+            raise ValueError(f"no staged revision candidate {candidate_id!r}")
+        revisions[candidate_id] = revision_from_dict(data)
+
+    selected = {
+        candidate_id: frozenset(window_ids)
+        for candidate_id, window_ids in (selected_window_ids or {}).items()
+    }
+    conflicts: List[JointConflict] = []
+    by_window: Dict[str, List[Tuple[str, PerceptionWindow]]] = {}
+    for candidate_id in ids:
+        revision = revisions[candidate_id]
+        allowed = selected.get(candidate_id)
+        if allowed is not None:
+            missing = allowed - {window.window_id for window in revision.windows}
+            if missing:
+                raise ValueError(
+                    f"candidate {candidate_id!r} has no windows {sorted(missing)}"
+                )
+        for window in revision.windows:
+            if allowed is None or window.window_id in allowed:
+                by_window.setdefault(window.window_id, []).append(
+                    (candidate_id, window)
+                )
+        for constraint in revision.constraints:
+            endpoints = {constraint.first_id, constraint.second_id}
+            available = {window.window_id for window in revision.windows}
+            if allowed is not None and not endpoints.issubset(allowed & available):
+                conflicts.append(
+                    JointConflict(
+                        kind="unsupported_constraint",
+                        candidate_ids=(candidate_id,),
+                        window_ids=tuple(sorted(endpoints)),
+                        constraints=(
+                            replace(constraint, source_candidate_ids=(candidate_id,)),
+                        ),
+                        message=(
+                            f"候选 {candidate_id} 的约束 {constraint.first_id}->"
+                            f"{constraint.second_id} 依赖未选窗口，不能静默删除"
+                        ),
+                    )
+                )
+
+    merged_windows: List[PerceptionWindow] = []
+    window_sources: List[Tuple[str, Tuple[str, ...]]] = []
+    for window_id in sorted(by_window):
+        sources = tuple(by_window[window_id])
+        source_ids = tuple(candidate_id for candidate_id, _ in sources)
+        earliest = max(window.earliest_ms for _, window in sources)
+        latest = min(window.latest_ms for _, window in sources)
+        delays = {window.delay_ms for _, window in sources}
+        base_window = sources[0][1]
+        if earliest > latest:
+            conflicts.append(
+                JointConflict(
+                    kind="shared_window_range",
+                    candidate_ids=source_ids,
+                    window_ids=(window_id,),
+                    message=(
+                        f"共享窗口 {window_id} 的时间范围无交集："
+                        + ", ".join(
+                            f"{candidate_id}=[{window.earliest_ms},{window.latest_ms}]"
+                            for candidate_id, window in sources
+                        )
+                    ),
+                )
+            )
+        if len(delays) != 1:
+            conflicts.append(
+                JointConflict(
+                    kind="shared_window_delay",
+                    candidate_ids=source_ids,
+                    window_ids=(window_id,),
+                    message=(
+                        f"共享窗口 {window_id} 的反应延迟不一致："
+                        + ", ".join(
+                            f"{candidate_id}={window.delay_ms}ms"
+                            for candidate_id, window in sources
+                        )
+                    ),
+                )
+            )
+        merged_windows.append(
+            replace(
+                base_window,
+                earliest_ms=earliest,
+                latest_ms=latest,
+                observed={
+                    **base_window.observed,
+                    "joint_proposal_id": proposal_id,
+                    "joint_sources": {
+                        candidate_id: {
+                            "earliest_ms": window.earliest_ms,
+                            "latest_ms": window.latest_ms,
+                            "delay_ms": window.delay_ms,
+                            "observed": dict(window.observed),
+                        }
+                        for candidate_id, window in sources
+                    },
+                },
+            )
+        )
+        window_sources.append((window_id, source_ids))
+
+    constraints = _joint_constraints(ids, revisions, by_window, selected, conflicts)
+    for index, constraint in enumerate(joint_constraints):
+        if constraint.kind not in {"after", "same"}:
+            raise ValueError(f"unknown constraint kind: {constraint.kind!r}")
+        if not {
+            constraint.first_id,
+            constraint.second_id,
+        }.issubset(by_window):
+            conflicts.append(
+                JointConflict(
+                    kind="unsupported_constraint",
+                    candidate_ids=ids,
+                    window_ids=(constraint.first_id, constraint.second_id),
+                    constraints=(constraint,),
+                    message="联合跨窗口约束引用了未选窗口，不能静默删除",
+                )
+            )
+            continue
+        key = (constraint.kind, constraint.first_id, constraint.second_id)
+        existing = next(
+            (item for item in constraints if (item.kind, item.first_id, item.second_id) == key),
+            None,
+        )
+        sourced = replace(
+            constraint,
+            source_candidate_ids=(
+                *constraint.source_candidate_ids,
+                f"joint:{proposal_id}:{index}",
+            ),
+        )
+        if existing is None:
+            constraints.append(sourced)
+        else:
+            constraints[constraints.index(existing)] = replace(
+                existing,
+                source_candidate_ids=(
+                    *existing.source_candidate_ids,
+                    *sourced.source_candidate_ids,
+                ),
+            )
+    conflicts.extend(_constraint_graph_conflicts(constraints))
+    base_revision = revisions[ids[0]]
+    base_changes_data = base_revision.base_changes
+    for candidate_id in ids[1:]:
+        other = revisions[candidate_id].base_changes
+        if _stable(other) != _stable(base_changes_data):
+            conflicts.append(
+                JointConflict(
+                    kind="base_change",
+                    candidate_ids=(ids[0], candidate_id),
+                    message="候选建立在不同的基础分支修改上，不能沿同一联合时间线合并",
+                )
+            )
+    proposal = JointProposal(
+        proposal_id=proposal_id,
+        candidate_ids=ids,
+        windows=tuple(merged_windows),
+        constraints=tuple(constraints),
+        window_sources=tuple(window_sources),
+        base_scenario=base_revision.base_scenario,
+        base_changes=base_changes_data,
+        at_ms=base_revision.at_ms,
+        horizon_ms=horizon_ms if horizon_ms is not None else base_revision.horizon_ms,
+        created_at_ms=engine.now_ms,
+        reason=reason,
+        conflicts=tuple(conflicts),
+    )
+    engine.pending_joint_proposals[proposal_id] = joint_proposal_to_dict(proposal)
+    return proposal
+
+
+def _joint_constraints(
+    candidate_ids: Sequence[str],
+    revisions: Mapping[str, PerceptionRevision],
+    selected_windows: Mapping[str, Sequence[Tuple[str, PerceptionWindow]]],
+    selected: Mapping[str, frozenset[str]],
+    conflicts: List[JointConflict],
+) -> List[WindowConstraint]:
+    combined: Dict[Tuple[str, str, str], WindowConstraint] = {}
+    selected_ids = set(selected_windows)
+    for candidate_id in candidate_ids:
+        revision = revisions[candidate_id]
+        allowed = selected.get(candidate_id)
+        for constraint in revision.constraints:
+            if allowed is not None and not {
+                constraint.first_id,
+                constraint.second_id,
+            }.issubset(allowed):
+                continue
+            if not {
+                constraint.first_id,
+                constraint.second_id,
+            }.issubset(selected_ids):
+                conflicts.append(
+                    JointConflict(
+                        kind="unsupported_constraint",
+                        candidate_ids=(candidate_id,),
+                        window_ids=(
+                            constraint.first_id,
+                            constraint.second_id,
+                        ),
+                        message=f"候选 {candidate_id} 的约束引用了未入选窗口",
+                    )
+                )
+                continue
+            key = (constraint.kind, constraint.first_id, constraint.second_id)
+            existing = combined.get(key)
+            sources = (
+                tuple(existing.source_candidate_ids) + (candidate_id,)
+                if existing is not None
+                else (candidate_id,)
+            )
+            combined[key] = replace(constraint, source_candidate_ids=sources)
+    return [combined[key] for key in sorted(combined)]
+
+
+def _constraint_graph_conflicts(
+    constraints: Sequence[WindowConstraint],
+) -> List[JointConflict]:
+    windows = {
+        window
+        for constraint in constraints
+        for window in (constraint.first_id, constraint.second_id)
+    }
+    parent = {window: window for window in windows}
+
+    def find(window_id: str) -> str:
+        parent[window_id] = (
+            window_id if parent[window_id] == window_id else find(parent[window_id])
+        )
+        return parent[window_id]
+
+    for constraint in constraints:
+        if constraint.kind == "same":
+            parent[find(constraint.first_id)] = find(constraint.second_id)
+    edges = {
+        (find(constraint.first_id), find(constraint.second_id), constraint)
+        for constraint in constraints
+        if constraint.kind == "after"
+    }
+    adjacency: Dict[str, set] = {window: set() for window in parent.values()}
+    for source, target, _ in edges:
+        if source != target:
+            adjacency[source].add(target)
+    visiting: List[str] = []
+    visited: set[str] = set()
+
+    def visit(node: str) -> Optional[List[str]]:
+        visiting.append(node)
+        for child in adjacency[node]:
+            if child in visiting:
+                return visiting[visiting.index(child):] + [child]
+            if child not in visited:
+                found = visit(child)
+                if found is not None:
+                    return found
+        visiting.remove(node)
+        visited.add(node)
+        return None
+
+    for node in sorted(adjacency):
+        cycle = visit(node)
+        if cycle is not None:
+            cycle_nodes = set(cycle)
+            involved = [
+                constraint
+                for _, _, constraint in edges
+                if find(constraint.first_id) in cycle_nodes
+                and find(constraint.second_id) in cycle_nodes
+            ]
+            return [
+                JointConflict(
+                    kind="constraint_cycle",
+                    candidate_ids=tuple(
+                        sorted(
+                            {
+                                candidate_id
+                                for constraint in involved
+                                for candidate_id in constraint.source_candidate_ids
+                            }
+                        )
+                    ),
+                    window_ids=tuple(sorted(cycle_nodes)),
+                    constraints=tuple(involved),
+                    message="跨窗口刺激顺序形成约束环，联合时间线不存在严格先后解释",
+                )
+            ]
+    return []
+
+
 def derive_revision_candidate(
     engine: ReplayEngine,
     candidate_id: str,
@@ -596,6 +966,203 @@ def undo_revision_selection(engine: ReplayEngine) -> Optional[str]:
             engine.pending_revisions[current] = adopted
     engine.selected_revision_id = previous
     return previous
+
+
+def load_joint_proposal(
+    engine: ReplayEngine, proposal_id: str
+) -> Optional[JointProposal]:
+    data = engine.pending_joint_proposals.get(proposal_id)
+    if data is None:
+        data = engine.adopted_joint_proposals.get(proposal_id)
+    return joint_proposal_from_dict(data) if data else None
+
+
+def list_pending_joint_proposals(engine: ReplayEngine) -> Tuple[JointProposal, ...]:
+    return tuple(
+        joint_proposal_from_dict(data)
+        for data in engine.pending_joint_proposals.values()
+    )
+
+
+def derive_joint_proposal(
+    engine: ReplayEngine,
+    proposal_id: str,
+    *,
+    evaluate_until_ms: Optional[int] = None,
+) -> JointRevisionResult:
+    """确认后沿同一基础时间线派生整个联合解释。"""
+    proposal = load_joint_proposal(engine, proposal_id)
+    if proposal is None:
+        raise ValueError(f"no joint proposal {proposal_id!r}")
+    if proposal.conflicts:
+        raise JointProposalIncompatible(proposal)
+    revision = PerceptionRevision(
+        windows=proposal.windows,
+        constraints=proposal.constraints,
+        base_scenario=proposal.base_scenario,
+        base_changes=proposal.base_changes,
+        at_ms=proposal.at_ms,
+        scheme_prefix=proposal.proposal_id,
+        horizon_ms=proposal.horizon_ms,
+        created_at_ms=proposal.created_at_ms,
+        reason=proposal.reason,
+        candidate_id=proposal.proposal_id,
+        note="joint:" + ",".join(proposal.candidate_ids),
+    )
+    result = _rederive_revision(
+        revision, evaluate_until_ms=evaluate_until_ms
+    )
+    return JointRevisionResult(
+        proposal=proposal,
+        schemes=result.schemes,
+        constraint_violations=result.constraint_violations,
+        report=result.report,
+    )
+
+
+def confirm_joint_proposal(
+    engine: ReplayEngine,
+    proposal_id: str,
+    *,
+    evaluate_until_ms: Optional[int] = None,
+) -> JointRevisionResult:
+    """显式确认联合提案；重复确认幂等，不重复压栈或生成重复事实。"""
+    pending_data = engine.pending_joint_proposals.get(proposal_id)
+    adopted_data = engine.adopted_joint_proposals.get(proposal_id)
+    if pending_data is None:
+        if adopted_data is None:
+            raise ValueError(f"no joint proposal {proposal_id!r}")
+        proposal = joint_proposal_from_dict(adopted_data)
+        if proposal.conflicts:
+            raise JointProposalIncompatible(proposal)
+        result = derive_joint_proposal(
+            engine, proposal_id, evaluate_until_ms=evaluate_until_ms
+        )
+        engine.pending_revision = None
+        return result
+
+    proposal = joint_proposal_from_dict(pending_data)
+    if proposal.conflicts:
+        raise JointProposalIncompatible(proposal)
+    result = derive_joint_proposal(
+        engine, proposal_id, evaluate_until_ms=evaluate_until_ms
+    )
+    engine.adopted_joint_proposals[proposal_id] = dict(pending_data)
+    engine.pending_joint_proposals.pop(proposal_id, None)
+    for candidate_id in proposal.candidate_ids:
+        candidate_data = engine.pending_revisions.pop(candidate_id, None)
+        if candidate_data is not None:
+            engine.adopted_revisions[candidate_id] = candidate_data
+    engine.pending_revision = None
+    if engine.selected_joint_proposal_id != proposal_id:
+        engine.joint_selection_history.append(
+            engine.selected_joint_proposal_id
+        )
+        engine.selected_joint_proposal_id = proposal_id
+    return result
+
+
+def withdraw_joint_candidate(
+    engine: ReplayEngine,
+    proposal_id: str,
+    candidate_id: str,
+) -> JointProposal:
+    """从已确认联合中局部撤回一个来源；失去依据的窗口重新待审。"""
+    original_data = engine.adopted_joint_proposals.get(proposal_id)
+    if original_data is None:
+        raise ValueError(f"no adopted joint proposal {proposal_id!r}")
+    original = joint_proposal_from_dict(original_data)
+    if candidate_id not in original.candidate_ids:
+        raise ValueError(
+            f"candidate {candidate_id!r} is not a source of {proposal_id!r}"
+        )
+
+    remaining_ids = tuple(
+        source_id
+        for source_id in original.candidate_ids
+        if source_id != candidate_id
+    )
+    kept_sources = tuple(
+        (window_id, tuple(source for source in sources if source != candidate_id))
+        for window_id, sources in original.window_sources
+        if any(source != candidate_id for source in sources)
+    )
+    kept_ids = {window_id for window_id, _ in kept_sources}
+    restored_ids = tuple(
+        sorted(
+            {
+                window_id
+                for window_id, sources in original.window_sources
+                if sources == (candidate_id,)
+            }
+        )
+    )
+    windows = tuple(
+        window
+        for window in original.windows
+        if window.window_id in kept_ids
+    )
+    conflicts: List[JointConflict] = []
+    for restored_id in restored_ids:
+        conflicts.append(
+            JointConflict(
+                kind="restored_pending",
+                candidate_ids=(candidate_id,),
+                window_ids=(restored_id,),
+                message=f"撤回 {candidate_id} 后，窗口 {restored_id} 失去依据并恢复待审",
+            )
+        )
+    constraints: List[WindowConstraint] = []
+    for constraint in original.constraints:
+        if constraint.first_id in kept_ids and constraint.second_id in kept_ids:
+            constraints.append(constraint)
+        else:
+            conflicts.append(
+                JointConflict(
+                    kind="unsupported_constraint",
+                    candidate_ids=tuple(
+                        source
+                        for source in constraint.source_candidate_ids
+                        if source != candidate_id
+                    )
+                    or (candidate_id,),
+                    window_ids=(constraint.first_id, constraint.second_id),
+                    constraints=(constraint,),
+                    message="局部撤回后约束端点失去依据，保留为冲突而非静默删除",
+                )
+            )
+    partial = JointProposal(
+        proposal_id=proposal_id,
+        candidate_ids=remaining_ids,
+        windows=windows,
+        constraints=tuple(constraints),
+        window_sources=kept_sources,
+        base_scenario=original.base_scenario,
+        base_changes=original.base_changes,
+        at_ms=original.at_ms,
+        horizon_ms=original.horizon_ms,
+        created_at_ms=original.created_at_ms,
+        reason=original.reason,
+        conflicts=tuple(conflicts),
+        withdrawn_candidate_ids=(
+            *original.withdrawn_candidate_ids,
+            candidate_id,
+        ),
+        restored_window_ids=(
+            *original.restored_window_ids,
+            *restored_ids,
+        ),
+    )
+    engine.pending_joint_proposals[proposal_id] = joint_proposal_to_dict(partial)
+    withdrawn_revision = engine.adopted_revisions.pop(candidate_id, None)
+    if withdrawn_revision is not None:
+        engine.pending_revisions[candidate_id] = withdrawn_revision
+    if engine.selected_joint_proposal_id == proposal_id:
+        engine.joint_selection_history.append(
+            engine.selected_joint_proposal_id
+        )
+        engine.selected_joint_proposal_id = None
+    return partial
 
 
 def _rederive_revision(
@@ -688,6 +1255,38 @@ def compare_revision_candidates(
     )
 
 
+def compare_joint_revisions(
+    results: Sequence[JointRevisionResult],
+    until_ms: Optional[int] = None,
+    base_engine: Optional[ReplayEngine] = None,
+) -> Tuple[CandidateComparison, ...]:
+    """比较联合方案；每个联合方案整体在自己的同一条时间线上重放。"""
+    adapted: List[RevisionResult] = []
+    for result in results:
+        proposal = result.proposal
+        adapted.append(
+            RevisionResult(
+                revision=PerceptionRevision(
+                    windows=proposal.windows,
+                    constraints=proposal.constraints,
+                    base_scenario=proposal.base_scenario,
+                    base_changes=proposal.base_changes,
+                    at_ms=proposal.at_ms,
+                    scheme_prefix=proposal.proposal_id,
+                    horizon_ms=proposal.horizon_ms,
+                    candidate_id=proposal.proposal_id,
+                    note="joint:" + ",".join(proposal.candidate_ids),
+                ),
+                schemes=result.schemes,
+                constraint_violations=result.constraint_violations,
+                report=result.report,
+            )
+        )
+    return compare_revision_candidates(
+        adapted, until_ms=until_ms, base_engine=base_engine
+    )
+
+
 def _compare_one(
     result: "RevisionResult",
     *,
@@ -711,6 +1310,9 @@ def _compare_one(
             latest_ms=window.latest_ms,
             tick_choices=len(window_ticks(window, tick_ms)) if tick_ms else 0,
             delay_ms=window.delay_ms,
+            source_candidate_ids=tuple(
+                window.observed.get("joint_sources", {}).keys()
+            ),
         )
         for window in stored.windows
     )
@@ -814,6 +1416,9 @@ def candidate_comparisons_to_dict(
                         "kind": constraint.kind,
                         "first_id": constraint.first_id,
                         "second_id": constraint.second_id,
+                        "source_candidate_ids": list(
+                            constraint.source_candidate_ids
+                        ),
                     }
                     for constraint in comparison.stimulus_order
                 ],
@@ -916,6 +1521,156 @@ def _revision_base_scenario(engine: ReplayEngine) -> Scenario:
     )
 
 
+def joint_proposal_to_dict(proposal: JointProposal) -> Dict[str, Any]:
+    return {
+        "proposal_id": proposal.proposal_id,
+        "candidate_ids": list(proposal.candidate_ids),
+        "windows": [
+            {
+                "window_id": window.window_id,
+                "vehicle_id": window.vehicle_id,
+                "stimulus": window.stimulus,
+                "source_id": window.source_id,
+                "earliest_ms": window.earliest_ms,
+                "latest_ms": window.latest_ms,
+                "delay_ms": window.delay_ms,
+                "observed": dict(window.observed),
+                "response_action": (
+                    dict(window.response_action)
+                    if window.response_action is not None
+                    else None
+                ),
+            }
+            for window in proposal.windows
+        ],
+        "constraints": [
+            {
+                "kind": constraint.kind,
+                "first_id": constraint.first_id,
+                "second_id": constraint.second_id,
+                "source_candidate_ids": list(
+                    constraint.source_candidate_ids
+                ),
+            }
+            for constraint in proposal.constraints
+        ],
+        "window_sources": [
+            [window_id, list(source_ids)]
+            for window_id, source_ids in proposal.window_sources
+        ],
+        "base_scenario": dict(proposal.base_scenario)
+        if proposal.base_scenario
+        else None,
+        "base_changes": dict(proposal.base_changes)
+        if proposal.base_changes
+        else None,
+        "at_ms": proposal.at_ms,
+        "horizon_ms": proposal.horizon_ms,
+        "created_at_ms": proposal.created_at_ms,
+        "reason": proposal.reason,
+        "conflicts": [
+            {
+                "kind": conflict.kind,
+                "candidate_ids": list(conflict.candidate_ids),
+                "window_ids": list(conflict.window_ids),
+                "constraints": [
+                    {
+                        "kind": constraint.kind,
+                        "first_id": constraint.first_id,
+                        "second_id": constraint.second_id,
+                        "source_candidate_ids": list(
+                            constraint.source_candidate_ids
+                        ),
+                    }
+                    for constraint in conflict.constraints
+                ],
+                "message": conflict.message,
+            }
+            for conflict in proposal.conflicts
+        ],
+        "withdrawn_candidate_ids": list(
+            proposal.withdrawn_candidate_ids
+        ),
+        "restored_window_ids": list(proposal.restored_window_ids),
+    }
+
+
+def joint_proposal_from_dict(data: Mapping[str, Any]) -> JointProposal:
+    return JointProposal(
+        proposal_id=data["proposal_id"],
+        candidate_ids=tuple(data.get("candidate_ids", ())),
+        windows=tuple(
+            PerceptionWindow(
+                window_id=window["window_id"],
+                vehicle_id=window["vehicle_id"],
+                stimulus=window["stimulus"],
+                source_id=window["source_id"],
+                earliest_ms=int(window["earliest_ms"]),
+                latest_ms=int(window["latest_ms"]),
+                delay_ms=int(window["delay_ms"]),
+                observed=dict(window.get("observed", {})),
+                response_action=dict(window["response_action"])
+                if window.get("response_action") is not None
+                else None,
+            )
+            for window in data.get("windows", ())
+        ),
+        constraints=tuple(
+            WindowConstraint(
+                kind=constraint["kind"],
+                first_id=constraint["first_id"],
+                second_id=constraint["second_id"],
+                source_candidate_ids=tuple(
+                    constraint.get("source_candidate_ids", ())
+                ),
+            )
+            for constraint in data.get("constraints", ())
+        ),
+        window_sources=tuple(
+            (window_id, tuple(source_ids))
+            for window_id, source_ids in data.get("window_sources", ())
+        ),
+        base_scenario=dict(data["base_scenario"])
+        if data.get("base_scenario")
+        else None,
+        base_changes=dict(data["base_changes"])
+        if data.get("base_changes")
+        else None,
+        at_ms=int(data["at_ms"]) if data.get("at_ms") is not None else None,
+        horizon_ms=int(data["horizon_ms"])
+        if data.get("horizon_ms") is not None
+        else None,
+        created_at_ms=int(data["created_at_ms"])
+        if data.get("created_at_ms") is not None
+        else None,
+        reason=data.get("reason"),
+        conflicts=tuple(
+            JointConflict(
+                kind=conflict["kind"],
+                candidate_ids=tuple(conflict.get("candidate_ids", ())),
+                window_ids=tuple(conflict.get("window_ids", ())),
+                constraints=tuple(
+                    WindowConstraint(
+                        kind=constraint["kind"],
+                        first_id=constraint["first_id"],
+                        second_id=constraint["second_id"],
+                        source_candidate_ids=tuple(
+                            constraint.get("source_candidate_ids", ())
+                        ),
+                    )
+                    for constraint in conflict.get("constraints", ())
+                ),
+                message=conflict.get("message", ""),
+            )
+            for conflict in data.get("conflicts", ())
+        ),
+        withdrawn_candidate_ids=tuple(
+            data.get("withdrawn_candidate_ids", ())
+        ),
+        restored_window_ids=tuple(data.get("restored_window_ids", ())),
+    )
+
+
 def branch_changes_to_dict(changes: BranchChanges) -> Dict[str, Any]:
     return {
         "vehicle_routes": {k: [list(p) for p in v] for k, v in changes.vehicle_routes.items()},
@@ -1005,6 +1760,9 @@ def revision_to_dict(revision: PerceptionRevision) -> Dict[str, Any]:
                 "kind": constraint.kind,
                 "first_id": constraint.first_id,
                 "second_id": constraint.second_id,
+                "source_candidate_ids": list(
+                    constraint.source_candidate_ids
+                ),
             }
             for constraint in revision.constraints
         ],
@@ -1044,6 +1802,9 @@ def revision_from_dict(data: Mapping[str, Any]) -> PerceptionRevision:
                 kind=constraint["kind"],
                 first_id=constraint["first_id"],
                 second_id=constraint["second_id"],
+                source_candidate_ids=tuple(
+                    constraint.get("source_candidate_ids", ())
+                ),
             )
             for constraint in data.get("constraints", ())
         ),
